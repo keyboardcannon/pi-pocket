@@ -1382,6 +1382,7 @@ class BoxRuntime {
             await backend.stop(this.#spec(backend));
             this.#manager.record(this.#name!, { lastActivity: this.#lastActivity, running: false });
             this.#setState("stopped");
+            this.#manager.boxNotice(this.#name, "info", `Box ${this.#name} stopped`);
         })()
             .catch((error: unknown) => {
                 this.#manager.boxNotice(
