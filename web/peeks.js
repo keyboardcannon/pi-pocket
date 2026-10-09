@@ -10,7 +10,7 @@ import { describeCall } from "./calls.js";
 import { workspaceOrder } from "./sessions.js";
 import { actions, api, attempt, canSteer, navigate, notify, store } from "./store.js";
 import { prefs, setPrefs } from "./theme.js";
-import { html, Icon, shortPath, usePresence } from "./ui.js";
+import { html, Icon, placeLabel, usePresence } from "./ui.js";
 
 /** Wide enough for the column beside the conversation: where People and the Browser panel dock too. */
 export const PEEK_WIDE = matchMedia("(min-width: 1100px)");
@@ -620,7 +620,7 @@ class PeekTile extends Component {
                 <span class="session-state">${mark}</span>
                 <span class="peek-name">
                     <span class="peek-title">${title}</span>
-                    <span class="peek-cwd mono">${shortPath(session.cwd, home)}</span>
+                    <span class="peek-cwd mono">${placeLabel(session, home)}</span>
                 </span>
                 ${
                     number !== undefined &&

@@ -12,6 +12,7 @@ import {
     canSteer,
     closeSheet,
     collab,
+    currentBox,
     navigate,
     notify,
     openSheet,
@@ -186,6 +187,7 @@ export function MenuSheet() {
                   steer &&
                   driving &&
                   !scoped() &&
+                  currentBox() === undefined &&
                   item(
                       "Working directory",
                       () => openSheet({ type: "cwd", mode: "change" }),

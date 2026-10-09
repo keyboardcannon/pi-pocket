@@ -16,7 +16,17 @@ import {
     store,
 } from "./store.js";
 import { isPinned, prefs, setPrefs, togglePin } from "./theme.js";
-import { html, Icon, Keys, shortPath, Slide, timeAgo, usePresence, useSlide } from "./ui.js";
+import {
+    html,
+    Icon,
+    Keys,
+    placeLabel,
+    shortPath,
+    Slide,
+    timeAgo,
+    usePresence,
+    useSlide,
+} from "./ui.js";
 
 /** The session list on its way: rows shaped like sessions, lit in turn. */
 function LoadingSessions() {
@@ -242,7 +252,7 @@ function SessionRow({ session, index, number, needle, selected, onPick, onSelect
                 <span class="session-meta">
                     <span class="mono">
                         <${Highlight}
-                            text=${shortPath(session.cwd, server?.home)}
+                            text=${placeLabel(session, server?.home)}
                             needle=${needle}
                         />
                     </span>
@@ -313,15 +323,23 @@ function groupsOf(shown, { tab, needle, home, pinned }) {
     const byKey = new Map();
 
     for (const session of rest) {
-        const key = tab === "folders" ? `dir:${session.cwd}` : `day:${dayGroup(session.updatedAt)}`;
+        // Paprika: box sessions group by project, where local ones group by folder.
+        const key =
+            tab !== "folders"
+                ? `day:${dayGroup(session.updatedAt)}`
+                : session.box !== undefined
+                  ? `project:${session.box.project}`
+                  : `dir:${session.cwd}`;
 
         if (!byKey.has(key)) {
             byKey.set(key, {
                 key,
                 label:
-                    tab === "folders"
-                        ? html`<${FolderName} path=${shortPath(session.cwd, home)} />`
-                        : dayGroup(session.updatedAt),
+                    tab !== "folders"
+                        ? dayGroup(session.updatedAt)
+                        : session.box !== undefined
+                          ? placeLabel(session, home)
+                          : html`<${FolderName} path=${shortPath(session.cwd, home)} />`,
                 rows: [],
             });
         }
@@ -400,7 +418,7 @@ export function SessionList({ compact = false }) {
         (session) =>
             Boolean(session.archived) === archived &&
             (needle === "" ||
-                `${session.title ?? ""} ${session.cwd} ${shortPath(session.cwd, server?.home)} ${session.model ?? ""}`
+                `${session.title ?? ""} ${session.cwd} ${placeLabel(session, server?.home)} ${session.model ?? ""}`
                     .toLowerCase()
                     .includes(needle)),
     );

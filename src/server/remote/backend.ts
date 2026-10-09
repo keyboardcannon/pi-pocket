@@ -29,8 +29,24 @@ export interface BoxBackend {
     asUser?(command: string): string;
     /** A shell command as root; default: `sudo -n bash -c '<command>'`. */
     asRoot?(command: string): string;
-    /** Creates a box from the provider's base image, named `name`, and returns once commands can run in it. */
-    create(request: { name: string; project: string }): Promise<{ sandboxId: string }>;
+    /**
+     * Creates a box named `name` from the provider's base image, or from the snapshot `from` (see `snapshot`), and
+     * returns once commands can run in it.
+     */
+    create(request: {
+        name: string;
+        project: string;
+        from?: string;
+    }): Promise<{ sandboxId: string }>;
+    /** Optional: what the base image is now (a name or hash), so snapshots made from an older one are not used. */
+    baseImage?(): Promise<string | undefined>;
+    /**
+     * Optional: saves a running box as the snapshot `name`, which new boxes can be created `from`, and resolves once it
+     * is usable. Projects' boxes then start from their project's snapshot instead of running setup.sh.
+     */
+    snapshot?(box: BoxSpec, name: string): Promise<void>;
+    /** Optional: deletes a snapshot made by `snapshot`. */
+    deleteSnapshot?(name: string): Promise<void>;
     /** Deletes a box and its disk. */
     destroy(box: BoxSpec): Promise<void>;
     status(box: BoxSpec): Promise<BoxStatus>;

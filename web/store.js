@@ -1046,6 +1046,7 @@ export function currentBox() {
         if (session?.box !== undefined) {
             return {
                 project: session.box.project,
+                title: session.projectTitle ?? session.box.project,
                 name: session.box.name,
                 state:
                     session.boxState ?? (session.box.sandboxId === undefined ? "none" : "stopped"),

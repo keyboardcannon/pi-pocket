@@ -29,7 +29,7 @@ import {
     themeVars,
     varsStyle,
 } from "./theme.js";
-import { copyText, html, Icon, Keys, Marked, shortPath, Slide, timeAgo, useSlide } from "./ui.js";
+import { copyText, html, Icon, Keys, Marked, placeLabel, Slide, timeAgo, useSlide } from "./ui.js";
 
 /**
  * How well `query` matches `text` as a subsequence: null for no match, else a score (higher is better) and the matched
@@ -268,8 +268,8 @@ function sessionItems() {
             kind: "session",
             key: `session:${session.id}`,
             label: session.title ?? "New session",
-            detail: `${shortPath(session.cwd, server?.home)} · ${session.busy ? "working" : timeAgo(session.updatedAt)}${session.archived ? " · archived" : ""}`,
-            text: `${session.title ?? "New session"} ${shortPath(session.cwd, server?.home)}`,
+            detail: `${placeLabel(session, server?.home)} · ${session.busy ? "working" : timeAgo(session.updatedAt)}${session.archived ? " · archived" : ""}`,
+            text: `${session.title ?? "New session"} ${placeLabel(session, server?.home)}`,
             icon: session.waiting ? "shield" : session.busy ? "pulse" : "chat",
             keys: number >= 0 && number < 9 ? `Alt ${number + 1}` : undefined,
             rank: session.archived ? -20 : -number * 0.01,

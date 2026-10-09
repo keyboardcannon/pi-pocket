@@ -52,6 +52,11 @@ req.end(body);
 `;
 }
 
+/** Removes the box's git URL rewrites, which hold its key (before a snapshot of the box is saved). */
+export function gitForgetCommand(key: string): string {
+    return `git config --global --remove-section 'url.http://127.0.0.1:${BOX_GIT_PORT}/${key}/github.com/' 2>/dev/null; true`;
+}
+
 /** The box's git setup: GitHub through the tunnel, commits as the server's GitHub account. */
 export function gitSetupCommands(key: string, identity: { name: string; email: string }): string {
     const base = `http://127.0.0.1:${BOX_GIT_PORT}/${key}/github.com/`;

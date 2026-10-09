@@ -3,7 +3,16 @@ import { browserAvailable, openInBrowser, toggleBrowser } from "./browser.js";
 import { filesAvailable, toggleFiles } from "./files-panel.js";
 import { branchAvailable } from "./sheets/branch.js";
 import { togglePeeks } from "./peeks.js";
-import { actions, collab, navigate, notify, openSheet, scoped, store } from "./store.js";
+import {
+    actions,
+    collab,
+    currentBox,
+    navigate,
+    notify,
+    openSheet,
+    scoped,
+    store,
+} from "./store.js";
 import { chooseTheme, THEMES } from "./theme.js";
 import { copyText, formatTokens, formatWhen, modelLabel, replyText, shortPath } from "./ui.js";
 
@@ -192,7 +201,10 @@ function showSession() {
         );
     }
 
-    parts.push(`$${(stats.cost ?? 0).toFixed(2)}`, shortPath(view.agent?.cwd, server?.home));
+    parts.push(
+        `$${(stats.cost ?? 0).toFixed(2)}`,
+        currentBox()?.title ?? shortPath(view.agent?.cwd, server?.home),
+    );
     notify("info", parts.join(" · "));
 }
 

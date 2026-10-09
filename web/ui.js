@@ -705,6 +705,13 @@ export function replyText(entry) {
 }
 
 /** `~/x` for paths under home. */
+/** Paprika: where a session works, as people know it: a box session's project, otherwise its folder. */
+export function placeLabel(session, home) {
+    return session?.box !== undefined
+        ? (session.projectTitle ?? session.box.project)
+        : shortPath(session?.cwd, home);
+}
+
 export function shortPath(path, home) {
     if (!path) {
         return "";

@@ -50,6 +50,13 @@ export function BoxSheet() {
                     you before anything else.
                 </div>`
         }
+        ${
+            box.setup?.snapshot &&
+            html`<div class="list-item">
+                <span>Setup</span>
+                <span>from the project's snapshot</span>
+            </div>`
+        }
         <div class="muted pad">
             The box stops after five idle minutes and starts again when Pi needs it. Its files stay; running processes do
             not.

@@ -2,7 +2,8 @@
  * Paprika: projects that sessions can run in a box. One folder per project in $PI_POCKET_PROJECTS_DIR:
  *
  *   <name>/project.json   { "name": "<name>", "title"?: "...", "repos": ["owner/name", ...] }
- *                         repos: the GitHub repositories the project's boxes may read and push (see git-proxy.ts)
+ *                         repos: the GitHub repositories the project's boxes may write to (they read any; see
+ *                         git-proxy.ts)
  *   <name>/setup.sh       optional: run once in a new box, in /workspace, to build the project's environment
  *   <name>/resume.sh      optional: run every time the box starts, before the agent's calls go through
  *   <name>/AGENTS.md      optional: added to the system prompt of the project's sessions
@@ -35,6 +36,29 @@ function projectsDir(): string | undefined {
 
 function optionalFile(path: string): string | undefined {
     return existsSync(path) ? readFileSync(path, "utf8") : undefined;
+}
+
+/** A project's title for people, from its project.json alone; its name when it has none (or is gone). */
+export function projectTitle(name: string): string {
+    const dir = projectsDir();
+
+    try {
+        if (dir !== undefined && NAME.test(name)) {
+            const title = (
+                JSON.parse(readFileSync(join(dir, name, "project.json"), "utf8")) as {
+                    title?: unknown;
+                }
+            ).title;
+
+            if (typeof title === "string" && title.trim() !== "") {
+                return title.trim();
+            }
+        }
+    } catch {
+        // No project.json, or not JSON: the name will do.
+    }
+
+    return name;
 }
 
 /** A project by name, read fresh from disk; undefined when there is no such project. */
@@ -123,8 +147,9 @@ function runGit(cwd: string, args: string[]): Promise<string> {
 }
 
 /**
- * Writes files into a project's folder, commits them as `identity`, and pushes the configuration repository's
- * current branch. Pulls first, so the commit sits on top of what is on GitHub. Returns what was committed.
+ * Writes files into a project's folder and, when the projects folder is in a git repository, commits them as
+ * `identity`. A repository with a remote is pulled first and pushed after, so the commit sits on top of the remote's;
+ * one without (a repository on this server only, for history) is just committed to. Returns what was saved.
  */
 export async function saveProjectFiles(
     name: string,
@@ -139,9 +164,12 @@ export async function saveProjectFiles(
     }
 
     const folder = join(dir, name);
-    const root = await runGit(folder, ["rev-parse", "--show-toplevel"]);
+    const root = await runGit(folder, ["rev-parse", "--show-toplevel"]).catch(() => undefined);
+    const remote = root !== undefined && (await runGit(root, ["remote"])) !== "";
 
-    await runGit(root, ["pull", "--ff-only", "--quiet"]);
+    if (remote) {
+        await runGit(root, ["pull", "--ff-only", "--quiet"]);
+    }
 
     const paths: string[] = [];
 
@@ -155,6 +183,10 @@ export async function saveProjectFiles(
         }
 
         paths.push(path);
+    }
+
+    if (root === undefined) {
+        return `Saved ${paths.length} file(s); the projects folder is not in a git repository, so nothing was committed.`;
     }
 
     await runGit(root, ["add", "--", ...paths]);
@@ -173,7 +205,10 @@ export async function saveProjectFiles(
         "-m",
         message,
     ]);
-    await runGit(root, ["push", "--quiet", "origin", "HEAD"]);
 
-    return `Saved and pushed: ${await runGit(root, ["log", "-1", "--stat", "--format=%h %s"])}`;
+    if (remote) {
+        await runGit(root, ["push", "--quiet", "origin", "HEAD"]);
+    }
+
+    return `${remote ? "Saved and pushed" : "Saved and committed"}: ${await runGit(root, ["log", "-1", "--stat", "--format=%h %s"])}`;
 }

@@ -36,6 +36,7 @@ import {
     actions,
     attempt,
     canSteer,
+    currentBox,
     dismiss,
     filesShown,
     navigate,
@@ -66,7 +67,8 @@ function Topbar() {
             ? `subagent of ${conversation.parent?.title ?? "?"}`
             : conversation?.worktree
               ? `⎇ ${view.branch?.branch ?? conversation.worktree.branch}`
-              : shortPath(view.agent?.cwd ?? conversation?.cwd, server?.home);
+              : (currentBox()?.title ??
+                shortPath(view.agent?.cwd ?? conversation?.cwd, server?.home));
     const busySubagents = (view.subagents ?? []).filter((agent) => agent.busy).length;
     // Other sessions waiting for an approval, counted on the way back to them.
     const waiting = store.state.sessions.filter(

@@ -28,7 +28,7 @@ import {
     loadBoxBackend,
     shellQuote,
 } from "./backend.ts";
-import { ghShim, gitSetupCommands } from "./box-files.ts";
+import { ghShim, gitForgetCommand, gitSetupCommands } from "./box-files.ts";
 import { daemonBundle } from "./bundle.ts";
 import { RemoteExecutionEnv } from "./env.ts";
 import { BOX_GIT_PORT, GitProxy } from "./git-proxy.ts";
@@ -57,7 +57,12 @@ export interface ScriptResult {
     readonly at: number;
     /** Its log, in the box (logs stay there). */
     readonly log: string;
+    /** The box started from this project snapshot, so setup.sh did not run in it (its log is the snapshot's). */
+    readonly snapshot?: string;
 }
+
+/** A project's snapshot: its boxes start from it while `fingerprint` (base image and setup.sh) still matches. */
+type ProjectSnapshot = { name: string; fingerprint: string; at: number };
 
 /** The parts of the git proxy the boxes use (a fake one in tests). */
 export interface BoxGitProxy {
@@ -96,9 +101,14 @@ type BoxRecord = {
     resume?: ScriptResult;
     /** Older records: setup finished (before results were kept). */
     setupDone?: boolean;
+    /** The project snapshot the box was created from. */
+    fromSnapshot?: string;
 };
 
-type StateFile = { boxes: Record<string, BoxRecord> };
+type StateFile = {
+    boxes: Record<string, BoxRecord>;
+    projectSnapshots?: Record<string, ProjectSnapshot>;
+};
 
 const DEFAULT_IDLE_MS = 5 * 60_000;
 const DEFAULT_LEASE_MS = 60 * 60_000;
@@ -417,6 +427,60 @@ export class BoxManager {
         this.#save();
     }
 
+    /**
+     * What a project's snapshot would be made from now: the backend's base image and the project's setup.sh.
+     * Undefined when the backend cannot snapshot or the project has no setup.sh (nothing to save time on).
+     */
+    async snapshotFingerprint(backend: BoxBackend, project: Project): Promise<string | undefined> {
+        if (backend.snapshot === undefined || project.setup === undefined) {
+            return undefined;
+        }
+
+        return createHash("sha256")
+            .update(`${(await backend.baseImage?.()) ?? ""}\0${project.setup}`)
+            .digest("hex")
+            .slice(0, 12);
+    }
+
+    /** The project's snapshot, when it was made from what the project's boxes would be made from now. */
+    async usableSnapshot(
+        backend: BoxBackend,
+        project: Project,
+    ): Promise<ProjectSnapshot | undefined> {
+        const saved = this.#loadState().projectSnapshots?.[project.name];
+        const fingerprint = await this.snapshotFingerprint(backend, project);
+
+        return saved !== undefined && fingerprint !== undefined && saved.fingerprint === fingerprint
+            ? saved
+            : undefined;
+    }
+
+    projectSnapshot(project: string): ProjectSnapshot | undefined {
+        return this.#loadState().projectSnapshots?.[project];
+    }
+
+    setProjectSnapshot(project: string, snapshot: ProjectSnapshot): void {
+        const state = this.#loadState();
+
+        state.projectSnapshots = { ...state.projectSnapshots, [project]: snapshot };
+        this.#save();
+    }
+
+    readonly #snapshotting = new Map<string, Promise<void>>();
+
+    /** Runs `save` unless a snapshot of the project is being saved already (by another box). */
+    snapshotOnce(project: string, save: () => Promise<void>): Promise<void> {
+        if (this.#snapshotting.has(project)) {
+            return Promise.resolve();
+        }
+
+        const saving = save().finally(() => this.#snapshotting.delete(project));
+
+        this.#snapshotting.set(project, saving);
+
+        return saving;
+    }
+
     #save(): void {
         try {
             writeFileSync(this.#statePath(), `${JSON.stringify(this.#loadState(), null, 2)}\n`, {
@@ -662,7 +726,12 @@ class BoxRuntime {
         this.#setState("creating");
         this.#manager.notice("info", `Creating box ${this.#name}…`);
         const began = Date.now();
-        const { sandboxId } = await backend.create({ name: this.#name, project: project.name });
+        const from = await this.#manager.usableSnapshot(backend, project);
+        const { sandboxId } = await backend.create({
+            name: this.#name,
+            project: project.name,
+            ...(from === undefined ? {} : { from: from.name }),
+        });
 
         this.#sandboxId = sandboxId;
         this.#manager.record(this.#name, {
@@ -671,6 +740,7 @@ class BoxRuntime {
             gitKey: randomBytes(24).toString("base64url"),
             running: true,
             lastActivity: Date.now(),
+            ...(from === undefined ? {} : { fromSnapshot: from.name }),
         });
         this.#manager.registerBox(this.#name, this);
         await this.#manager.options.saveBox(this.#rootId, {
@@ -678,7 +748,10 @@ class BoxRuntime {
             name: this.#name,
             sandboxId,
         });
-        this.#manager.notice("info", `Box ${this.#name} created in ${seconds(began)}`);
+        this.#manager.notice(
+            "info",
+            `Box ${this.#name} created in ${seconds(began)}${from === undefined ? "" : ` from ${from.name}`}`,
+        );
     }
 
     async #connect(_context: Context): Promise<ChildProcessWithoutNullStreams> {
@@ -724,12 +797,7 @@ class BoxRuntime {
             ),
             "create the workspace",
         );
-        await this.#must(
-            ssh,
-            asBoxUser(backend, "umask 077; mkdir -p ~/.pocket/bin; cat > ~/.pocket/env"),
-            "write the project's secrets",
-            project.secrets ?? "",
-        );
+        await this.#writeSecrets(ssh, backend, project);
         await this.#setupGit(ssh, backend, project);
 
         // The project's files, as working copies in the box: the scripts run from there, and the agent may change
@@ -752,7 +820,20 @@ class BoxRuntime {
             }
         }
 
-        if (project.setup !== undefined) {
+        const fromSnapshot = this.#manager.recordOf(this.#name!).fromSnapshot;
+
+        if (fromSnapshot !== undefined) {
+            // Made from the project's snapshot: setup.sh ran when the snapshot was saved.
+            this.#manager.record(this.#name!, {
+                setup: {
+                    ok: true,
+                    exitCode: 0,
+                    at: Date.now(),
+                    log: "~/.pocket/setup.log",
+                    snapshot: fromSnapshot,
+                },
+            });
+        } else if (project.setup !== undefined) {
             this.#manager.notice("info", `Running ${project.name}/setup.sh in box ${this.#name}…`);
             const result = await this.#script(ssh, backend, "setup", SETUP_TIMEOUT_S);
 
@@ -763,6 +844,10 @@ class BoxRuntime {
                     ? `setup.sh finished in box ${this.#name}`
                     : `setup.sh failed in box ${this.#name} (exit ${result.exitCode}); log: ${result.log} in the box`,
             );
+
+            if (result.ok) {
+                await this.#saveSnapshot(ssh, backend, project);
+            }
         } else {
             this.#manager.record(this.#name!, {
                 setup: { ok: true, exitCode: 0, at: Date.now(), log: "" },
@@ -770,6 +855,88 @@ class BoxRuntime {
         }
 
         await this.#resume(ssh, backend);
+    }
+
+    /** The project's secrets, to ~/.pocket/env (which also makes ~/.pocket/). */
+    async #writeSecrets(ssh: string[], backend: BoxBackend, project: Project): Promise<void> {
+        await this.#must(
+            ssh,
+            asBoxUser(backend, "umask 077; mkdir -p ~/.pocket/bin; cat > ~/.pocket/env"),
+            "write the project's secrets",
+            project.secrets ?? "",
+        );
+    }
+
+    /**
+     * After a successful setup.sh: saves the box as its project's snapshot, so the project's next boxes start from it
+     * instead of running setup.sh, and deletes the project's older snapshot. The box's own secrets (the project's
+     * secrets, its git key and the git URL rewrites holding it) are out of the box while the snapshot is saved, and
+     * back after. A failure is reported, and the box goes on.
+     */
+    async #saveSnapshot(ssh: string[], backend: BoxBackend, project: Project): Promise<void> {
+        const fingerprint = await this.#manager.snapshotFingerprint(backend, project);
+        const previous = this.#manager.projectSnapshot(project.name);
+
+        if (
+            fingerprint === undefined ||
+            backend.snapshot === undefined ||
+            previous?.fingerprint === fingerprint
+        ) {
+            return;
+        }
+
+        const name = `pocket-${project.name}-${fingerprint}`;
+        const gitKey = this.#manager.recordOf(this.#name!).gitKey ?? "";
+
+        await this.#manager.snapshotOnce(project.name, async () => {
+            this.#manager.notice(
+                "info",
+                `Saving ${project.name}'s snapshot ${name}, for its next boxes…`,
+            );
+            const began = Date.now();
+
+            try {
+                await this.#must(
+                    ssh,
+                    asBoxUser(
+                        backend,
+                        `rm -f ~/.pocket/env ~/.pocket/git-key; ${gitForgetCommand(gitKey)}; sync`,
+                    ),
+                    "take the box's secrets out for the snapshot",
+                );
+
+                try {
+                    await backend.snapshot!(this.#spec(backend), name);
+                } finally {
+                    await this.#writeSecrets(ssh, backend, project);
+                    await this.#setupGit(ssh, backend, project);
+                }
+            } catch (error) {
+                this.#manager.notice(
+                    "warning",
+                    `Could not save ${project.name}'s snapshot: ${describe(error)}`,
+                );
+
+                return;
+            }
+
+            this.#manager.setProjectSnapshot(project.name, { name, fingerprint, at: Date.now() });
+            this.#manager.notice(
+                "info",
+                `Saved ${project.name}'s snapshot ${name} in ${seconds(began)}: its next boxes start from it`,
+            );
+
+            if (previous !== undefined && previous.name !== name) {
+                await backend
+                    .deleteSnapshot?.(previous.name)
+                    .catch((error: unknown) =>
+                        this.#manager.notice(
+                            "warning",
+                            `Could not delete ${project.name}'s older snapshot ${previous.name}: ${describe(error)}`,
+                        ),
+                    );
+            }
+        });
     }
 
     /** GitHub through the git proxy on this server: the box's key, git's URL rewrites and identity, and `gh`. */

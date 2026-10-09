@@ -98,9 +98,9 @@ test("a fetch of an allowed repository reaches GitHub with the server's token", 
     );
 });
 
-test("another repository, or an unknown key, is refused without asking GitHub", async () => {
+test("a write to another repository, or an unknown key, is refused without asking GitHub", async () => {
     seen.length = 0;
-    const other = await fetch(`${base}/owner/other.git/info/refs?service=git-upload-pack`);
+    const other = await fetch(`${base}/owner/other.git/info/refs?service=git-receive-pack`);
 
     assert.equal(other.status, 403);
     assert.match(await other.text(), /not one of this project's repositories/);

@@ -1,6 +1,6 @@
 /**
  * Paprika: a box session's project files. The box holds working copies of its project's setup.sh, resume.sh, and
- * AGENTS.md in ~/.pocket/; this tool saves them back to the project on the server, committed and pushed, so later
+ * AGENTS.md in ~/.pocket/; this tool saves them back to the project on the server, committed there, so later
  * boxes of the project get them. It also clears the note about a failed setup.sh once that is settled.
  */
 import { Type } from "@earendil-works/pi-ai";
@@ -12,7 +12,7 @@ const saveProjectFiles = defineTool({
     name: "save_project_files",
     description:
         "Box sessions only. Save this box's working copies of the project's files (~/.pocket/setup.sh, " +
-        "~/.pocket/resume.sh, ~/.pocket/AGENTS.md) to the project on the server, committed and pushed, so later boxes " +
+        "~/.pocket/resume.sh, ~/.pocket/AGENTS.md) to the project on the server (committed there), so later boxes " +
         "of this project use them. Only when the user asked for the change. setupResolved: true clears the note " +
         "that this box's setup.sh failed.",
     parameters: Type.Object({

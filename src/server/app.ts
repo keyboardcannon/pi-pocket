@@ -80,6 +80,7 @@ import { Spend } from "./spend.ts";
 import { Transcripts } from "./transcripts.ts";
 import { Workspace } from "./workspace.ts";
 import { BoxManager } from "./remote/boxes.ts";
+import { projectTitle } from "./remote/projects.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -1191,6 +1192,10 @@ export class PocketApp {
                     id: Number(id),
                     ...meta,
                     ...(box === undefined ? {} : { boxState: box.state }),
+                    // Paprika: a box session shows its project where a local one shows its folder.
+                    ...(meta.box === undefined
+                        ? {}
+                        : { projectTitle: projectTitle(meta.box.project) }),
                     ...(box?.setup === undefined ? {} : { boxSetup: box.setup }),
                     busy,
                     waiting: waiting.has(id),

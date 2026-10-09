@@ -3,9 +3,10 @@
  *
  * Boxes reach this proxy through a reverse SSH tunnel (127.0.0.1:BOX_GIT_PORT inside the box). Their git config
  * rewrites https://github.com/ to http://127.0.0.1:BOX_GIT_PORT/<box key>/github.com/, so plain git commands come here.
- * The proxy checks the box's project allows the repository, adds this server's GitHub token, and streams the request
- * to GitHub and the answer back. It refuses pushes that update a repository's default branch: agents push branches
- * and open pull requests.
+ * The proxy adds this server's GitHub token and streams the request to GitHub and the answer back. Boxes may read any
+ * repository the token can (public ones included, for submodules and upstreams); they may write only to their
+ * project's repositories, and never to a repository's default branch: agents push branches and open pull requests.
+ * Git LFS goes the same way: its batch requests come here, and the files themselves come from GitHub's storage.
  *
  * `gh` in a box is a small script that posts its arguments to /<box key>/gh; the real `gh` runs here, with GH_REPO
  * set to the repository, and its output goes back.
@@ -23,12 +24,12 @@ export const BOX_GIT_PORT = 7777;
 
 export interface BoxAccess {
     readonly box: string;
-    /** Allowed repositories, `owner/name`, lower case. */
+    /** Repositories the box may write to, `owner/name`, lower case. */
     readonly repos: readonly string[];
 }
 
 const GIT_PATH =
-    /^\/([A-Za-z0-9_-]{16,})\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+    /^\/([A-Za-z0-9_-]{16,})\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack|info\/lfs\/objects\/batch|info\/lfs\/locks\/verify)$/;
 const GH_PATH = /^\/([A-Za-z0-9_-]{16,})\/gh$/;
 /** gh subcommands a box may run. */
 const GH_ALLOWED = new Set([
@@ -203,20 +204,57 @@ export class GitProxy {
         }
 
         const repo = `${git[2]}/${git[3]}`.toLowerCase();
+        const writable = access.repos.includes(repo);
 
-        if (!access.repos.includes(repo)) {
-            this.#log(`git proxy: ${access.box}: refused ${repo} (not in the project's repos)`);
+        const notWritable = () => {
+            this.#log(
+                `git proxy: ${access.box}: refused a write to ${repo} (not in the project's repos)`,
+            );
 
-            return refuse(response, 403, `${repo} is not one of this project's repositories`);
-        }
-
-        const service = git[4] === "info/refs" ? url.searchParams.get("service") : git[4];
-
-        if (service !== "git-upload-pack" && service !== "git-receive-pack") {
-            return refuse(response, 403, "unsupported git service");
-        }
+            return `${repo} is not one of this project's repositories: it can be read, not written`;
+        };
 
         let body: Readable | undefined = request.method === "POST" ? request : undefined;
+
+        if (git[4]!.startsWith("info/lfs/")) {
+            if (request.method !== "POST") {
+                return refuse(response, 405, "LFS requests are POSTs");
+            }
+
+            const raw = await readAll(request, 1_000_000);
+
+            if (git[4] === "info/lfs/locks/verify" && !writable) {
+                // Only pushes verify locks: none go to a repository the box cannot write to.
+                return lfsRefuse(response, 403, notWritable());
+            }
+
+            if (git[4] === "info/lfs/objects/batch" && !writable) {
+                let operation: unknown;
+
+                try {
+                    operation = (JSON.parse(raw.toString("utf8")) as { operation?: unknown })
+                        .operation;
+                } catch {
+                    return lfsRefuse(response, 400, "not a Git LFS batch request");
+                }
+
+                if (operation !== "download") {
+                    return lfsRefuse(response, 403, notWritable());
+                }
+            }
+
+            body = Readable.from([raw]);
+        } else {
+            const service = git[4] === "info/refs" ? url.searchParams.get("service") : git[4];
+
+            if (service !== "git-upload-pack" && service !== "git-receive-pack") {
+                return refuse(response, 403, "unsupported git service");
+            }
+
+            if (service === "git-receive-pack" && !writable) {
+                return refuse(response, 403, notWritable());
+            }
+        }
 
         if (git[4] === "git-receive-pack") {
             // The push's ref updates come first, before the pack: check them, then send them on with the rest.
@@ -412,6 +450,30 @@ function rejectPush(
         });
         response.end(body);
     });
+}
+
+/** A request's whole body, refusing one longer than `limit` bytes. */
+async function readAll(request: IncomingMessage, limit: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+
+    for await (const chunk of request) {
+        size += (chunk as Buffer).length;
+
+        if (size > limit) {
+            throw new Error("request too large");
+        }
+
+        chunks.push(chunk as Buffer);
+    }
+
+    return Buffer.concat(chunks);
+}
+
+/** A refusal Git LFS shows: its own JSON, with the message. */
+function lfsRefuse(response: ServerResponse, status: number, message: string): void {
+    response.writeHead(status, { "content-type": "application/vnd.git-lfs+json" });
+    response.end(JSON.stringify({ message: `pocket: ${message}` }));
 }
 
 /**
