@@ -7776,3 +7776,15 @@ textarea.notes {
         scroll-margin-top: 6.4rem;
     }
 }
+
+/* Paprika: the Box sheet's log. */
+.box-log {
+    max-height: 18rem;
+    overflow-y: auto;
+    padding: 0 1rem 1rem;
+}
+
+.box-log-line {
+    padding: 0.2rem 0;
+    overflow-wrap: anywhere;
+}

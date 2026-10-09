@@ -1,7 +1,7 @@
-// Paprika: the session's remote box: its project and state, and stopping or destroying it.
-import { useState } from "preact/hooks";
+// Paprika: the session's remote box: its project and state, its log, and stopping or destroying it.
+import { useEffect, useState } from "preact/hooks";
 import { actions, attempt, closeSheet, currentBox } from "../store.js";
-import { html, Icon, Sheet } from "../ui.js";
+import { html, Icon, openFile, Sheet } from "../ui.js";
 
 const STATES = {
     none: "No box yet: it starts with the next message",
@@ -12,6 +12,44 @@ const STATES = {
     stopping: "Stopping…",
     stopped: "Stopped: it starts again when Pi needs it",
 };
+
+/** When a log line happened, short: the time today, the day and time before. */
+function logTime(at) {
+    const when = new Date(at);
+    const today = when.toDateString() === new Date().toDateString();
+
+    return when.toLocaleString([], {
+        ...(today ? {} : { month: "short", day: "numeric" }),
+        hour: "2-digit",
+        minute: "2-digit",
+    });
+}
+
+/** What happened to the box, newest first: kept on the server, also after the notices are gone. */
+function BoxLog({ state }) {
+    const [lines, setLines] = useState(null);
+
+    useEffect(() => {
+        actions.boxLog().then(
+            (result) => setLines(result.lines),
+            () => setLines([]),
+        );
+    }, [state]);
+
+    if (lines === null || lines.length === 0) {
+        return null;
+    }
+
+    return html`<div class="muted pad small">Log</div>
+        <div class="box-log">
+            ${lines.map(
+                (line) =>
+                    html`<div class=${`box-log-line small ${line.level === "warning" ? "warn" : ""}`}>
+                        <span class="muted mono">${logTime(line.at)}</span> ${line.text}
+                    </div>`,
+            )}
+        </div>`;
+}
 
 export function BoxSheet() {
     const box = currentBox();
@@ -63,6 +101,12 @@ export function BoxSheet() {
         </div>
         ${
             box.state === "running" &&
+            html`<button class="button wide" onClick=${() => openFile("~/.pocket/setup.log")}>
+                <${Icon} name="file" size=${15} /> Setup log
+            </button>`
+        }
+        ${
+            box.state === "running" &&
             html`<button class="button wide" onClick=${() => attempt(() => actions.boxAction("stop"))}>
                 <${Icon} name="stop" size=${15} /> Stop now
             </button>`
@@ -83,6 +127,7 @@ export function BoxSheet() {
                 ${confirm ? "Tap again to destroy the box and its files" : "Destroy box"}
             </button>`
         }
+        <${BoxLog} state=${box.state} />
     <//>`;
 }
 

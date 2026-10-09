@@ -57,7 +57,8 @@ const PASS_HEADERS = [
 
 export interface GitProxyOptions {
     access(key: string): BoxAccess | undefined;
-    log(line: string): void;
+    /** A line for the server's log; `box` when it is about one box (it goes in that box's log too). */
+    log(line: string, box?: string): void;
     /** GitHub's web address; default https://github.com (another in tests). */
     readonly github?: string;
     /** GitHub's API address; default https://api.github.com. */
@@ -70,7 +71,7 @@ export interface GitProxyOptions {
 
 export class GitProxy {
     readonly #access: (key: string) => BoxAccess | undefined;
-    readonly #log: (line: string) => void;
+    readonly #log: (line: string, box?: string) => void;
     readonly #github: string;
     readonly #api: string;
     readonly #ghCommand: string;
@@ -210,6 +211,7 @@ export class GitProxy {
         const notWritable = () => {
             this.#log(
                 `git proxy: ${access.box}: refused a write to ${repo} (not in the project's repos)`,
+                access.box,
             );
 
             return `${repo} is not one of this project's repositories: it can be read, not written`;
@@ -264,7 +266,10 @@ export class GitProxy {
             const blocked = commands.find((command) => command.ref === protectedRef);
 
             if (blocked !== undefined) {
-                this.#log(`git proxy: ${access.box}: refused push to ${repo} ${blocked.ref}`);
+                this.#log(
+                    `git proxy: ${access.box}: refused push to ${repo} ${blocked.ref}`,
+                    access.box,
+                );
 
                 return rejectPush(
                     request,
@@ -277,6 +282,7 @@ export class GitProxy {
 
             this.#log(
                 `git proxy: ${access.box}: push ${repo} ${commands.map((command) => command.ref).join(" ")}`,
+                access.box,
             );
             body = Readable.from(prepend(head, request));
         }
@@ -375,7 +381,10 @@ export class GitProxy {
             return reply(1, "", `gh: '${args.slice(0, 2).join(" ")}' is not available in boxes\n`);
         }
 
-        this.#log(`gh proxy: ${access.box}: gh ${args.slice(0, 2).join(" ")} (${repo})`);
+        this.#log(
+            `gh proxy: ${access.box}: gh ${args.slice(0, 2).join(" ")} (${repo})`,
+            access.box,
+        );
         // A throwaway empty repository whose origin is the allowed one: some gh commands insist on a local repository.
         const cwd = mkdtempSync(join(tmpdir(), "pocket-gh-"));
 

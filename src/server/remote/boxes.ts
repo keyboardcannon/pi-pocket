@@ -16,7 +16,14 @@
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+    appendFileSync,
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -116,6 +123,10 @@ const DEFAULT_LEASE_MS = 60 * 60_000;
 const RENEW_MARGIN_MS = 10 * 60_000;
 const SETUP_TIMEOUT_S = 30 * 60;
 const RESUME_TIMEOUT_S = 5 * 60;
+/** A box's log (box-logs/<box>.log) past this size loses its older half. */
+const MAX_BOX_LOG = 256 * 1024;
+/** The most lines of a box's log the Box sheet gets. */
+const BOX_LOG_LINES = 500;
 /** The largest file a box session's transcript shows from the box. */
 const MAX_CACHED_FILE = 25 * 1024 * 1024;
 
@@ -133,7 +144,10 @@ export class BoxManager {
             options.gitProxy ??
             new GitProxy({
                 access: (key) => this.#access(key),
-                log: (line) => this.notice("info", line),
+                log: (line, box) =>
+                    box === undefined
+                        ? this.notice("info", line)
+                        : this.boxNotice(box, "info", line),
             });
     }
 
@@ -162,6 +176,75 @@ export class BoxManager {
 
     notice(level: "info" | "warning", text: string): void {
         this.#options.notice(level, text);
+    }
+
+    #boxLogPath(box: string): string {
+        return join(
+            this.#options.dataDir,
+            "box-logs",
+            `${box.replace(/[^A-Za-z0-9._-]/g, "_")}.log`,
+        );
+    }
+
+    /**
+     * A notice about one box: shown as any notice is, and kept in the box's own log (box-logs/<box>.log in the data
+     * folder, also after the box is gone) for the Box sheet. Without a box (not created yet), only shown.
+     */
+    boxNotice(box: string | undefined, level: "info" | "warning", text: string): void {
+        this.notice(level, text);
+
+        if (box === undefined) {
+            return;
+        }
+
+        try {
+            const file = this.#boxLogPath(box);
+
+            mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+            appendFileSync(
+                file,
+                `${new Date().toISOString()} ${level} ${text.replace(/\s*\n\s*/g, " ")}\n`,
+                {
+                    mode: 0o600,
+                },
+            );
+
+            if (statSync(file).size > MAX_BOX_LOG) {
+                const lines = readFileSync(file, "utf8").split("\n");
+
+                writeFileSync(file, lines.slice(Math.floor(lines.length / 2)).join("\n"));
+            }
+        } catch {
+            // Shown already; the log is kept as well as it can be.
+        }
+    }
+
+    /** A session's box log, newest first: what happened to its box (empty before it has one). */
+    boxLog(rootId: string | number): { at: string; level: string; text: string }[] {
+        const name = this.#options.sessionBox(String(rootId))?.name;
+
+        if (name === undefined) {
+            return [];
+        }
+
+        let text: string;
+
+        try {
+            text = readFileSync(this.#boxLogPath(name), "utf8");
+        } catch {
+            return [];
+        }
+
+        return text
+            .split("\n")
+            .filter((line) => line !== "")
+            .slice(-BOX_LOG_LINES)
+            .reverse()
+            .map((line) => {
+                const [at = "", level = "", ...rest] = line.split(" ");
+
+                return { at, level, text: rest.join(" ") };
+            });
     }
 
     #backend(project: string): Promise<BoxBackend> {
@@ -224,7 +307,11 @@ export class BoxManager {
             : runtime.ensure().then(
                   () => undefined,
                   (error: unknown) =>
-                      this.notice("warning", `Could not prepare the box: ${describe(error)}`),
+                      this.boxNotice(
+                          runtime.name,
+                          "warning",
+                          `Could not prepare the box: ${describe(error)}`,
+                      ),
               );
     }
 
@@ -528,12 +615,20 @@ export class BoxManager {
             try {
                 if ((await backend.status(spec)) === "running") {
                     await backend.stop(spec);
-                    this.notice("info", `Stopped box ${name}: idle while the server was down`);
+                    this.boxNotice(
+                        name,
+                        "info",
+                        `Stopped box ${name}: idle while the server was down`,
+                    );
                 }
 
                 this.record(name, { running: false });
             } catch (error) {
-                this.notice("warning", `Could not stop idle box ${name}: ${describe(error)}`);
+                this.boxNotice(
+                    name,
+                    "warning",
+                    `Could not stop idle box ${name}: ${describe(error)}`,
+                );
             }
         }
     }
@@ -548,6 +643,12 @@ export class BoxManager {
 class BoxRuntime {
     readonly env: RemoteExecutionEnv;
     state: BoxState = "none";
+
+    /** The box's name, once it has a box. */
+    get name(): string | undefined {
+        return this.#name;
+    }
+
     readonly #manager: BoxManager;
     readonly #rootId: string;
     readonly #project: string;
@@ -719,7 +820,8 @@ class BoxRuntime {
                 this.#sandboxId !== undefined &&
                 (await backend.status(this.#spec(backend))) === "missing"
             ) {
-                this.#manager.notice(
+                this.#manager.boxNotice(
+                    this.#name,
                     "warning",
                     `Box ${this.#name} no longer exists; creating a new one`,
                 );
@@ -732,11 +834,15 @@ class BoxRuntime {
                 started = true;
             } else if ((await backend.status(this.#spec(backend))) !== "running") {
                 this.#setState("starting");
-                this.#manager.notice("info", `Starting box ${this.#name}…`);
+                this.#manager.boxNotice(this.#name, "info", `Starting box ${this.#name}…`);
                 const began = Date.now();
 
                 await backend.start(this.#spec(backend));
-                this.#manager.notice("info", `Box ${this.#name} started in ${seconds(began)}`);
+                this.#manager.boxNotice(
+                    this.#name,
+                    "info",
+                    `Box ${this.#name} started in ${seconds(began)}`,
+                );
                 this.#leaseUntil = 0;
                 started = true;
             }
@@ -775,7 +881,7 @@ class BoxRuntime {
 
         this.#name = `pocket-${project.name}-${this.#rootId}`;
         this.#setState("creating");
-        this.#manager.notice("info", `Creating box ${this.#name}…`);
+        this.#manager.boxNotice(this.#name, "info", `Creating box ${this.#name}…`);
         const began = Date.now();
         const from = await this.#manager.usableSnapshot(backend, project);
         const { sandboxId } = await backend.create({
@@ -799,7 +905,8 @@ class BoxRuntime {
             name: this.#name,
             sandboxId,
         });
-        this.#manager.notice(
+        this.#manager.boxNotice(
+            this.#name,
             "info",
             `Box ${this.#name} created in ${seconds(began)}${from === undefined ? "" : ` from ${from.name}`}`,
         );
@@ -885,11 +992,16 @@ class BoxRuntime {
                 },
             });
         } else if (project.setup !== undefined) {
-            this.#manager.notice("info", `Running ${project.name}/setup.sh in box ${this.#name}…`);
+            this.#manager.boxNotice(
+                this.#name,
+                "info",
+                `Running ${project.name}/setup.sh in box ${this.#name}…`,
+            );
             const result = await this.#script(ssh, backend, "setup", SETUP_TIMEOUT_S);
 
             this.#manager.record(this.#name!, { setup: result });
-            this.#manager.notice(
+            this.#manager.boxNotice(
+                this.#name,
                 result.ok ? "info" : "warning",
                 result.ok
                     ? `setup.sh finished in box ${this.#name}`
@@ -940,7 +1052,8 @@ class BoxRuntime {
         const gitKey = this.#manager.recordOf(this.#name!).gitKey ?? "";
 
         await this.#manager.snapshotOnce(project.name, async () => {
-            this.#manager.notice(
+            this.#manager.boxNotice(
+                this.#name,
                 "info",
                 `Saving ${project.name}'s snapshot ${name}, for its next boxes…`,
             );
@@ -963,7 +1076,8 @@ class BoxRuntime {
                     await this.#setupGit(ssh, backend, project);
                 }
             } catch (error) {
-                this.#manager.notice(
+                this.#manager.boxNotice(
+                    this.#name,
                     "warning",
                     `Could not save ${project.name}'s snapshot: ${describe(error)}`,
                 );
@@ -972,7 +1086,8 @@ class BoxRuntime {
             }
 
             this.#manager.setProjectSnapshot(project.name, { name, fingerprint, at: Date.now() });
-            this.#manager.notice(
+            this.#manager.boxNotice(
+                this.#name,
                 "info",
                 `Saved ${project.name}'s snapshot ${name} in ${seconds(began)}: its next boxes start from it`,
             );
@@ -981,7 +1096,8 @@ class BoxRuntime {
                 await backend
                     .deleteSnapshot?.(previous.name)
                     .catch((error: unknown) =>
-                        this.#manager.notice(
+                        this.#manager.boxNotice(
+                            this.#name,
                             "warning",
                             `Could not delete ${project.name}'s older snapshot ${previous.name}: ${describe(error)}`,
                         ),
@@ -1034,7 +1150,8 @@ class BoxRuntime {
         this.#manager.record(this.#name!, { resume: result });
 
         if (!result.ok) {
-            this.#manager.notice(
+            this.#manager.boxNotice(
+                this.#name,
                 "warning",
                 `resume.sh failed in box ${this.#name} (exit ${result.exitCode})`,
             );
@@ -1148,14 +1265,16 @@ class BoxRuntime {
                 );
 
                 if (result.code !== 0) {
-                    this.#manager.notice(
+                    this.#manager.boxNotice(
+                        this.#name,
                         "warning",
                         `Could not copy ${file.boxPath} into box ${this.#name}: ${result.output.trim()}`,
                     );
                 }
             }
         })().catch((error: unknown) =>
-            this.#manager.notice(
+            this.#manager.boxNotice(
+                this.#name,
                 "warning",
                 `Could not copy files into the box: ${describe(error)}`,
             ),
@@ -1223,7 +1342,8 @@ class BoxRuntime {
             await this.#renewLease(await this.#backend);
             this.#manager.record(this.#name!, { lastActivity: this.#lastActivity, running: true });
         } catch (error) {
-            this.#manager.notice(
+            this.#manager.boxNotice(
+                this.#name,
                 "warning",
                 `Could not renew the lease of box ${this.#name}: ${describe(error)}`,
             );
@@ -1242,7 +1362,7 @@ class BoxRuntime {
             return;
         }
 
-        this.#manager.notice("info", `Stopping idle box ${this.#name}`);
+        this.#manager.boxNotice(this.#name, "info", `Stopping idle box ${this.#name}`);
         await this.stopNow();
     }
 
@@ -1264,7 +1384,8 @@ class BoxRuntime {
             this.#setState("stopped");
         })()
             .catch((error: unknown) => {
-                this.#manager.notice(
+                this.#manager.boxNotice(
+                    this.#name,
                     "warning",
                     `Could not stop box ${this.#name}: ${describe(error)}`,
                 );
@@ -1287,7 +1408,7 @@ class BoxRuntime {
 
         await backend.destroy(this.#spec(backend));
         this.#manager.forget(this.#name!);
-        this.#manager.notice("info", `Destroyed box ${this.#name}`);
+        this.#manager.boxNotice(this.#name, "info", `Destroyed box ${this.#name}`);
         this.#sandboxId = undefined;
         this.#setState("none");
     }

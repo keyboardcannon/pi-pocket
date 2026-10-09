@@ -830,6 +830,7 @@ export const actions = {
         }),
     /** Paprika: "stop" or "destroy" the session's box. */
     boxAction: (action) => api(`c/${current()}/box`, { action }),
+    boxLog: () => api(`c/${current()}/box/log`),
     updateSession: (id, patch) => api(`sessions/${id}`, patch),
     upload: (file) => api(`c/${current()}/upload?name=${encodeURIComponent(file.name)}`, file),
     fullEntry: (entryId) => api(`c/${current()}/entry/${entryId}`),

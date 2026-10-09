@@ -199,6 +199,14 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    // Paprika: what happened to the session's box, newest first.
+    if (third === "box" && fourth === "log" && method === "GET") {
+        app.requireSee(user, id);
+        app.requireSteer(user);
+
+        return json(response, 200, { lines: app.boxes.boxLog(app.rootOf(id)) });
+    }
+
     // Paprika: stop or destroy the session's box.
     if (third === "box" && method === "POST") {
         const body = await readJson<{ action?: unknown }>(request);
