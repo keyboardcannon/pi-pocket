@@ -7,7 +7,11 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import { type BoxBackend, type BoxSpec, shellQuote } from "../src/server/remote/backend.ts";
+import { branchesIn, switchBranch } from "../src/server/branches.ts";
+import { changesIn, diffOf, revertFile } from "../src/server/changes.ts";
+import { FileLists, viewFile } from "../src/server/files.ts";
 import { type BoxLink, BoxManager } from "../src/server/remote/boxes.ts";
+import { envFiles, localFiles } from "../src/server/session-files.ts";
 
 let root: string;
 let remote: string;
@@ -292,3 +296,92 @@ test("an image the agent names is cached from a running box, and a stopped box i
     assert.equal(backend.starts, 0);
     await manager.dispose();
 });
+
+test("the panels read a running box's files and git through its environment, as they read local ones", async () => {
+    const { backend, manager } = session("good");
+
+    try {
+        await panelChecks(backend, manager);
+    } finally {
+        await manager.dispose();
+    }
+});
+
+async function panelChecks(backend: FakeBackend, manager: BoxManager): Promise<void> {
+    await manager.prepare("7");
+    const work = backend.workspace;
+
+    git(work, "init", "-q", "-b", "main");
+    writeFileSync(join(work, "a.txt"), "one\ntwo\n");
+    mkdirSync(join(work, "src"));
+    writeFileSync(join(work, "src", "b.ts"), "export const b = 1;\n");
+    git(work, "add", "-A");
+    git(work, "commit", "-q", "-m", "first");
+    writeFileSync(join(work, "a.txt"), "one\nthree\n");
+    writeFileSync(join(work, "new.txt"), "fresh\n");
+    writeFileSync(join(work, "bin.dat"), Buffer.from([0, 1, 2, 3, 255]));
+
+    const running = manager.runningEnv("7");
+
+    assert.ok(running !== undefined);
+    const boxFiles = envFiles(running);
+    const cwd = running.cwd;
+
+    assert.equal(cwd, work);
+    assert.equal(await manager.boxPath("7", "src/b.ts"), join(work, "src/b.ts"));
+    assert.equal(await manager.boxPath("7", "~/x"), `${backend.home}/x`);
+
+    // The same answers through the box as from this machine.
+    // Versions differ only in how finely the time is kept; each must be a size and a time.
+    const strip = (changes: Awaited<ReturnType<typeof changesIn>>) => ({
+        ...changes,
+        files: changes.files.map(({ version, ...file }) => {
+            assert.match(version ?? "", /^\d+:\d+(\.\d+)?$/);
+
+            return file;
+        }),
+    });
+
+    assert.deepEqual(
+        strip(await changesIn(cwd, [], false, boxFiles)),
+        strip(await changesIn(cwd, [], false)),
+    );
+    assert.equal(await diffOf(cwd, "a.txt", false, boxFiles), await diffOf(cwd, "a.txt", false));
+    assert.deepEqual(
+        await viewFile(join(work, "a.txt"), boxFiles),
+        await viewFile(join(work, "a.txt")),
+    );
+    assert.deepEqual(
+        await viewFile(join(work, "bin.dat"), boxFiles),
+        await viewFile(join(work, "bin.dat")),
+    );
+    assert.deepEqual(await viewFile(work, boxFiles), await viewFile(work));
+
+    const lists = new FileLists();
+    const listed = await lists.get(cwd, boxFiles, "box:7");
+
+    assert.deepEqual(
+        [...listed.files].sort(),
+        [...(await new FileLists().get(cwd, localFiles)).files].sort(),
+    );
+
+    const branches = await branchesIn(cwd, boxFiles);
+
+    assert.deepEqual(
+        branches.local.map((branch) => branch.name),
+        (await branchesIn(cwd)).local.map((branch) => branch.name),
+    );
+    assert.ok(branches.local.some((branch) => branch.name === "main" && branch.current));
+    assert.deepEqual(branches.head, { branch: "main" });
+
+    assert.equal(await revertFile(cwd, "new.txt", false, boxFiles), "new");
+    assert.equal(await revertFile(cwd, "a.txt", false, boxFiles), "modified");
+    assert.equal(readFileSync(join(work, "a.txt"), "utf8"), "one\ntwo\n");
+    await switchBranch(cwd, { name: "feature", create: true }, boxFiles);
+    assert.equal(git(work, "branch", "--show-current").trim(), "feature");
+
+    // A stopped box has no environment for the panels, and asking does not start it.
+    await manager.stop("7");
+    assert.equal(manager.runningEnv("7"), undefined);
+    assert.equal(backend.starts, 0);
+}

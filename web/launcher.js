@@ -164,7 +164,7 @@ function actionItems() {
         conversation &&
             branchAvailable() && {
                 label: "Switch branch",
-                detail: `on ${headLabel(view.branch)}`,
+                detail: view.branch ? `on ${headLabel(view.branch)}` : "in the box",
                 icon: "fork",
                 run: () => openSheet({ type: "branch" }),
             },

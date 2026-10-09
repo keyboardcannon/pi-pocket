@@ -4,10 +4,10 @@
  * there, with each file's diff on request.
  */
 import { realpathSync } from "node:fs";
-import { lstat, rm } from "node:fs/promises";
 import { devNull } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { type GitOptions, git as runGit } from "./git.ts";
+import type { GitOptions } from "./git.ts";
+import { localFiles, type SessionFiles } from "./session-files.ts";
 import type { ClientEntry } from "./projection.ts";
 
 /** How a file changed, as git sees it: `new` is a file git does not track yet. */
@@ -46,9 +46,11 @@ const MAX_FILES = 500;
 const MAX_DIFF = 300_000;
 const GIT_TIMEOUT_MS = 15_000;
 
-/** Git for Changes: quick, with room for a long diff. */
-const git = (cwd: string, args: string[], options: GitOptions = {}) =>
-    runGit(cwd, args, { timeoutMs: GIT_TIMEOUT_MS, maxBuffer: MAX_DIFF * 4, ...options });
+/** Git for Changes, in the session's files: quick, with room for a long diff. */
+const gitIn =
+    (fs: SessionFiles) =>
+    (cwd: string, args: string[], options: GitOptions = {}): Promise<string> =>
+        fs.git(cwd, args, { timeoutMs: GIT_TIMEOUT_MS, maxBuffer: MAX_DIFF * 4, ...options });
 /**
  * Diffs as the viewer reads them, whatever a person's git config says: no external diff program or text conversion, no
  * colors, git's usual `a/` and `b/` before the paths (`diff.mnemonicPrefix` and `diff.noprefix` change them), and
@@ -233,19 +235,15 @@ export function parseNumstat(output: string): Map<string, { added?: number; remo
 }
 
 /** A file's size and modification time, one of which changes when it does; undefined when it is not there. */
-async function versionOf(file: string): Promise<string | undefined> {
-    try {
-        const info = await lstat(file);
+async function versionOf(file: string, fs: SessionFiles): Promise<string | undefined> {
+    const info = await fs.info(file);
 
-        return `${info.size}:${info.mtimeMs}`;
-    } catch {
-        return undefined;
-    }
+    return info === undefined ? undefined : `${info.size}:${info.mtimeMs}`;
 }
 
 /** Where a folder is in its repository, as git writes paths: `app/` for the folder app, empty at the top. */
-async function prefixOf(cwd: string): Promise<string> {
-    return (await git(cwd, ["rev-parse", "--show-prefix"])).trim();
+async function prefixOf(cwd: string, fs: SessionFiles): Promise<string> {
+    return (await gitIn(fs)(cwd, ["rev-parse", "--show-prefix"])).trim();
 }
 
 /**
@@ -256,7 +254,9 @@ export async function changesIn(
     cwd: string,
     entries: readonly ClientEntry[],
     onlyHere = false,
+    fs: SessionFiles = localFiles,
 ): Promise<Changes> {
+    const git = gitIn(fs);
     let root: string;
 
     try {
@@ -271,7 +271,7 @@ export async function changesIn(
         };
     }
 
-    const edits = piEdits(entries, cwd, true);
+    const edits = piEdits(entries, cwd, fs.local);
     const branch = await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).then(
         (name) => name.trim(),
         () => undefined,
@@ -280,7 +280,7 @@ export async function changesIn(
         (id) => id.trim() || undefined,
         () => undefined,
     );
-    const prefix = onlyHere ? await prefixOf(cwd) : "";
+    const prefix = onlyHere ? await prefixOf(cwd, fs) : "";
     const changed = parseStatus(
         await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
     ).filter(({ path }) => path.startsWith(prefix));
@@ -290,7 +290,7 @@ export async function changesIn(
         branch === undefined
             ? new Map()
             : parseNumstat(await git(root, ["diff", "HEAD", "--numstat", "-z", ...DIFF_FLAGS]));
-    const versions = await Promise.all(status.map(({ path }) => versionOf(join(root, path))));
+    const versions = await Promise.all(status.map(({ path }) => versionOf(join(root, path), fs)));
     const files = status.map(({ code, path }, index): ChangedFile => {
         const version = versions[index];
 
@@ -323,14 +323,20 @@ export async function changesIn(
  * The diff of one changed file of the repository `cwd` is in, against the last commit; a new file's whole content.
  * Only files that git lists as changed: the path cannot point anywhere else. With `onlyHere`, only files in `cwd`.
  */
-export async function diffOf(cwd: string, path: string, onlyHere = false): Promise<string> {
+export async function diffOf(
+    cwd: string,
+    path: string,
+    onlyHere = false,
+    fs: SessionFiles = localFiles,
+): Promise<string> {
+    const git = gitIn(fs);
     const root = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
     const change = parseStatus(
         await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
     ).find((each) => each.path === path);
 
     // A file outside the folder is as unknown as one without changes.
-    if (change === undefined || (onlyHere && !path.startsWith(await prefixOf(cwd)))) {
+    if (change === undefined || (onlyHere && !path.startsWith(await prefixOf(cwd, fs)))) {
         throw new Error("That file has no uncommitted changes");
     }
 
@@ -358,13 +364,19 @@ export async function diffOf(cwd: string, path: string, onlyHere = false): Promi
  * `diffOf`, only a file git lists as changed, so the path cannot point anywhere else; with `onlyHere`, only one in
  * `cwd`. A renamed file is left alone, as undoing it changes two paths.
  */
-export async function revertFile(cwd: string, path: string, onlyHere = false): Promise<ChangeKind> {
+export async function revertFile(
+    cwd: string,
+    path: string,
+    onlyHere = false,
+    fs: SessionFiles = localFiles,
+): Promise<ChangeKind> {
+    const git = gitIn(fs);
     const root = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
     const change = parseStatus(
         await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
     ).find((each) => each.path === path);
 
-    if (change === undefined || (onlyHere && !path.startsWith(await prefixOf(cwd)))) {
+    if (change === undefined || (onlyHere && !path.startsWith(await prefixOf(cwd, fs)))) {
         throw new Error("That file has no uncommitted changes");
     }
 
@@ -380,7 +392,7 @@ export async function revertFile(cwd: string, path: string, onlyHere = false): P
     }
 
     if (kind === "new") {
-        await rm(join(root, path), { force: true });
+        await fs.remove(join(root, path));
 
         return kind;
     }
@@ -399,14 +411,14 @@ export async function revertFile(cwd: string, path: string, onlyHere = false): P
     if (kind === "added" && !inHead) {
         // Added since the last commit: out of the index, then gone.
         await git(root, ["rm", "--cached", "--quiet", "--force", "--", path]);
-        await rm(join(root, path), { force: true });
+        await fs.remove(join(root, path));
 
         return kind;
     }
 
     if (!hasHead) {
         await git(root, ["rm", "--cached", "--quiet", "--force", "--", path]);
-        await rm(join(root, path), { force: true });
+        await fs.remove(join(root, path));
 
         return kind;
     }

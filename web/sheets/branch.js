@@ -1,13 +1,25 @@
 // The branch picker: the git branch this session's folder has checked out, and the others to switch to or make, in a
 // menu up from the branch in the bar under the message box.
 import { useEffect, useRef, useState } from "preact/hooks";
-import { actions, attempt, canSteer, closeSheet, notify, scoped, store } from "../store.js";
+import {
+    actions,
+    attempt,
+    canSteer,
+    closeSheet,
+    currentBox,
+    notify,
+    scoped,
+    store,
+} from "../store.js";
+import { boxStoppedNotice } from "./box.js";
 import { anchorStyle, html, Icon, popAnchor, shortPath, timeAgo } from "../ui.js";
 
 const coarsePointer = matchMedia("(pointer: coarse)").matches;
 
 /** The picker is for people who can steer, in a session whose folder is in a git repository. */
-export const branchAvailable = () => canSteer() && Boolean(store.state.view.branch);
+// Paprika: a box session's branches are in its box, there to pick while it runs.
+export const branchAvailable = () =>
+    canSteer() && (Boolean(store.state.view.branch) || currentBox()?.state === "running");
 
 /** Where the picker opens: above the branch in the bar under the message box (`popAnchor`). */
 const branchAnchor = () => popAnchor(".status-line .branch");
@@ -66,6 +78,10 @@ function Track({ upstream }) {
  * searching.
  */
 export function BranchPicker() {
+    return boxStoppedNotice("its branches") ?? html`<${Picker} />`;
+}
+
+function Picker() {
     const { view, server } = store.state;
     const [query, setQuery] = useState(store.state.sheet?.query ?? "");
     const [branches, setBranches] = useState(null);

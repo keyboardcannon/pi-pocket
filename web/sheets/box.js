@@ -78,3 +78,36 @@ export function BoxSheet() {
         }
     <//>`;
 }
+
+/**
+ * Paprika: what a panel shows instead of a stopped box's files, or undefined when it can show them (a local session,
+ * or a box that is running). Panels never start a box by themselves; this button does.
+ */
+export function boxStoppedNotice(what) {
+    const box = currentBox();
+
+    if (box === undefined || box.state === "running") {
+        return undefined;
+    }
+
+    const starting = ["creating", "setting-up", "starting"].includes(box.state);
+    const startable = box.state === "none" || box.state === "stopped";
+    const said =
+        box.state === "none"
+            ? `This session has no box yet. Start one to see ${what}.`
+            : starting
+              ? `The box is starting; ${what} show when it runs.`
+              : box.state === "stopping"
+                ? "The box is stopping."
+                : `The box is stopped. Start it to see ${what}.`;
+
+    return html`<div class="muted pad">
+        <p>${said}</p>
+        ${
+            startable &&
+            html`<button class="button" onClick=${() => attempt(() => actions.boxAction("start"))}>
+                <${Icon} name="reload" size=${15} /> Start box
+            </button>`
+        }
+    </div>`;
+}

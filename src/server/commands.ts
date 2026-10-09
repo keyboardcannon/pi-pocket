@@ -5,7 +5,7 @@
  * command checks who may do it, and changes others should know about become activity lines in the session's chat.
  */
 import { randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
@@ -113,7 +113,12 @@ function entryIdOf(value: unknown): number {
  * a conversation holds many, and then every request fails until they leave its context.
  */
 async function modelImage(path: string, mimeType: string): Promise<ImageContent> {
-    const image = await resizeImage(readFileSync(path), mimeType);
+    return modelImageOf(readFileSync(path), mimeType);
+}
+
+/** As `modelImage`, from the image's bytes (Paprika: an image in a box). */
+async function modelImageOf(bytes: Buffer, mimeType: string): Promise<ImageContent> {
+    const image = await resizeImage(bytes, mimeType);
 
     if (image === null) {
         throw new Error("it could not be made small enough for the model");
@@ -490,16 +495,29 @@ export class Commands {
         const app = this.#app;
         const parts: (TextContent | ImageContent)[] = [];
         let total = 0;
+        let place: ReturnType<typeof app.workspace.place>;
+
+        try {
+            place = app.workspace.place(id);
+        } catch {
+            // Paprika: a stopped box is not started for this; Pi reads the files it names itself.
+            return parts;
+        }
 
         for (const mention of mentionedPaths(text).slice(0, MAX_MENTIONED)) {
             let file: string | undefined;
+            let size = 0;
 
             for (const candidate of mention.candidates) {
                 try {
-                    const resolved = app.workspace.readableFile(user, id, candidate);
+                    const resolved = place.box
+                        ? await app.boxes.boxPath(app.rootOf(id), candidate)
+                        : app.workspace.readableFile(user, id, candidate);
+                    const info = await place.fs.target(resolved);
 
-                    if (statSync(resolved).isFile()) {
+                    if (info?.kind === "file") {
                         file = resolved;
+                        size = info.size;
                         break;
                     }
                 } catch {
@@ -515,14 +533,14 @@ export class Commands {
                 const mime = IMAGE_MIME[extname(file).toLowerCase()];
 
                 if (mime !== undefined) {
-                    if (images && statSync(file).size <= MAX_INLINE_IMAGE) {
-                        parts.push(await modelImage(file, mime));
+                    if (images && size <= MAX_INLINE_IMAGE) {
+                        parts.push(await modelImageOf(await place.fs.readHead(file, size), mime));
                     }
 
                     continue;
                 }
 
-                const view = await viewFile(file);
+                const view = await viewFile(file, place.fs);
 
                 if (view.kind !== "text" || total >= MAX_MENTIONED_TOTAL) {
                     continue;
@@ -1042,7 +1060,10 @@ export class Commands {
             id: await this.#branch(id, user, {
                 at: entryId,
                 label: "fork",
-                worktree: request.worktree === true,
+                // Paprika: a box session's forks share its box; a worktree of its own is not offered there.
+                worktree:
+                    request.worktree === true &&
+                    this.#app.boxes.stateOf(this.#app.rootOf(id)) === undefined,
             }),
         };
     }
@@ -1138,7 +1159,10 @@ export class Commands {
             at: previous?.id as unknown as number | undefined,
             label,
             agent,
-            worktree: request.worktree === true,
+            // Paprika: a box session's forks share its box; a worktree of its own is not offered there.
+            worktree:
+                request.worktree === true &&
+                this.#app.boxes.stateOf(this.#app.rootOf(id)) === undefined,
             resend,
         });
         const submission = await (

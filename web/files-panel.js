@@ -7,7 +7,8 @@ import { useBack } from "./back.js";
 import { DiffReview, KIND_LETTERS, reloadChanges, useChanges, useWidth } from "./diff.js";
 import { loadFiles, suggestFiles } from "./files.js";
 import { FileView } from "./sheets/file.js";
-import { actions, canSteer, closePeople, currentBox, panelsBeside, store } from "./store.js";
+import { boxStoppedNotice } from "./sheets/box.js";
+import { actions, canSteer, closePeople, panelsBeside, store } from "./store.js";
 import { html, Icon, Loader, Marked, shortPath, usePresence } from "./ui.js";
 
 const OPEN_KEY = "pocket.files";
@@ -701,33 +702,24 @@ export function FilesPanel({ leaving = false }) {
             }
         </header>
         ${
-            // Paprika: these read this server's folder; a box session's files are in the box.
-            currentBox() !== undefined
-                ? html`<div class="files-body">
-                      <div class="muted pad">
-                          Files and changes aren't available in box sessions yet. Ask Pi, or run git status
-                          with a ! command.
-                      </div>
-                  </div>`
-                : html`<div
-                          class="files-body"
-                          role="tabpanel"
-                          aria-label="Files"
-                          hidden=${filesTab !== "files"}
-                      >
-                          <${FilesTab} changes=${changes} covering=${!beside && !leaving} />
-                      </div>
-                      <div
-                          class="files-body"
-                          role="tabpanel"
-                          aria-label="Changes"
-                          hidden=${filesTab !== "changes"}
-                      >
-                          <${DiffReview}
-                              active=${filesTab === "changes"}
-                              covering=${!beside && !leaving}
-                          />
-                      </div>`
+            // Paprika: a box session's files are in its box, shown only while it runs.
+            boxStoppedNotice("its files and changes") ??
+            html`<div
+                    class="files-body"
+                    role="tabpanel"
+                    aria-label="Files"
+                    hidden=${filesTab !== "files"}
+                >
+                    <${FilesTab} changes=${changes} covering=${!beside && !leaving} />
+                </div>
+                <div
+                    class="files-body"
+                    role="tabpanel"
+                    aria-label="Changes"
+                    hidden=${filesTab !== "changes"}
+                >
+                    <${DiffReview} active=${filesTab === "changes"} covering=${!beside && !leaving} />
+                </div>`
         }
     </section>`;
 }

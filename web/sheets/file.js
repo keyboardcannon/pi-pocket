@@ -7,6 +7,7 @@ import { highlightLines, langOf } from "../highlight.js";
 import { HtmlPreview } from "../rich.js";
 import { RunFrame } from "../run-frame.js";
 import { actions, canSteer, closeSheet, insertIntoComposer, notify, store } from "../store.js";
+import { boxStoppedNotice } from "./box.js";
 import {
     copyText,
     fileUrl,
@@ -267,10 +268,13 @@ export function FileSheet({ path, line }) {
     const [name, setName] = useState(path.replace(/\/$/, "").split("/").pop() || path);
 
     return html`<${Sheet} title=${name} onClose=${closeSheet} wide=${true}>
-        <${FileView}
+        ${
+            boxStoppedNotice("its files") ??
+            html`<${FileView}
             path=${path}
             line=${line}
             onLoad=${(file) => setName((file.display ?? path).replace(/\/$/, "").split("/").pop() || path)}
-        />
+        />`
+        }
     <//>`;
 }

@@ -15,7 +15,7 @@ import {
 } from "./diff-parse.js";
 import { highlight, highlightLines, langOf } from "./highlight.js";
 import { branchAvailable } from "./sheets/branch.js";
-import { actions, attempt, canSteer, notify, openSheet, store } from "./store.js";
+import { actions, attempt, canSteer, currentBox, notify, openSheet, store } from "./store.js";
 import { html, Icon, Loader, openFile, shortPath } from "./ui.js";
 
 // ─── Preferences ────────────────────────────────────────────────────────────────────
@@ -804,6 +804,13 @@ export function reloadChanges(id = store.state.conversationId) {
         return known.pending;
     }
 
+    // Paprika: a box session's changes are in its box; while it is not running there is nothing to ask for.
+    const box = String(id) === String(store.state.conversationId) ? currentBox() : undefined;
+
+    if (box !== undefined && box.state !== "running") {
+        return Promise.resolve(known);
+    }
+
     known.pending = actions.changes(id).then(
         (data) => Object.assign(known, { data, error: null, pending: null, at: Date.now() }),
         (failure) => Object.assign(known, { error: failure.message, pending: null }),
@@ -823,12 +830,14 @@ export function useChanges(live = true) {
     const known = changesCache.get(id);
     const lastEntry = store.state.view.order?.at(-1);
     const busy = store.state.view.live?.busy;
+    // Paprika: a box that starts has its changes to show.
+    const boxState = currentBox()?.state;
 
     useEffect(() => {
         if (!changesCache.get(id)?.data) {
             reloadChanges(id);
         }
-    }, [id]);
+    }, [id, boxState]);
     useEffect(() => {
         if (!live) {
             return;

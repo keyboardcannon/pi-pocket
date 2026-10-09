@@ -5,6 +5,7 @@ import {
     attempt,
     canSteer,
     closeSheet,
+    currentBox,
     navigate,
     notify,
     scoped,
@@ -146,6 +147,8 @@ export function MessageSheet({ entryId }) {
         ${
             canBranch &&
             view.conversation.inRepository &&
+            // Paprika: a box session's forks share its box.
+            currentBox() === undefined &&
             html`<label class="check">
                 <input type="checkbox" checked=${worktree} onChange=${(event) => setWorktree(event.currentTarget.checked)} /> New sessions get a git worktree of their own
             </label>`

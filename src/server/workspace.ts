@@ -25,6 +25,7 @@ import type { User } from "./config.ts";
 import { describe, HttpError } from "./errors.ts";
 import { FileLists, type FileListing, type FileView, viewFile } from "./files.ts";
 import { displayPath, expandHome } from "./paths.ts";
+import { envFiles, localFiles, type SessionFiles } from "./session-files.ts";
 
 export class Workspace {
     readonly #app: PocketApp;
@@ -59,6 +60,29 @@ export class Workspace {
         return gitDir;
     }
 
+    /**
+     * Paprika: where the app reads a conversation's files. A local session: its folder on this machine. A box session:
+     * its box's workspace, through the box, while the box runs; a stopped box is never started for a panel, which gets
+     * a 423 instead.
+     */
+    place(id: ConversationId): { cwd: string; fs: SessionFiles; key: string; box: boolean } {
+        const root = this.#app.rootOf(id);
+
+        if (this.#app.boxes.stateOf(root) === undefined) {
+            const cwd = this.#app.cwdOf(id);
+
+            return { cwd, fs: localFiles, key: cwd, box: false };
+        }
+
+        const env = this.#app.boxes.runningEnv(root);
+
+        if (env === undefined) {
+            throw new HttpError(423, "The box is stopped.");
+        }
+
+        return { cwd: env.cwd, fs: envFiles(env), key: `box:${String(root)}`, box: true };
+    }
+
     /** Whether a folder is in a git repository. */
     inRepository(cwd: string): boolean {
         return this.#gitDir(cwd) !== undefined;
@@ -66,6 +90,11 @@ export class Workspace {
 
     /** What a conversation's folder has checked out, for its view: its repository's HEAD file, read as it is now. */
     head(id: ConversationId): Head | undefined {
+        // Paprika: a box session's repository is in its box; this machine's folder says nothing about it.
+        if (this.#app.boxes.stateOf(this.#app.rootOf(id)) !== undefined) {
+            return undefined;
+        }
+
         const gitDir = this.#gitDir(this.#app.cwdOf(id));
 
         return gitDir === undefined ? undefined : headOf(gitDir);
@@ -76,13 +105,13 @@ export class Workspace {
         this.#app.requireSee(user, id);
         this.#app.requireSteer(user);
 
-        const cwd = this.#app.cwdOf(id);
+        const { cwd, fs, box } = this.place(id);
 
-        if (this.#gitDir(cwd) === undefined) {
+        if (!box && this.#gitDir(cwd) === undefined) {
             throw new HttpError(404, "This session's folder is not in a git repository.");
         }
 
-        return branchesIn(cwd).catch((error: unknown) => {
+        return branchesIn(cwd, fs).catch((error: unknown) => {
             throw new HttpError(409, describe(error));
         });
     }
@@ -110,13 +139,13 @@ export class Workspace {
         const track = typeof request.track === "string" ? request.track : undefined;
         const name =
             typeof request.name === "string" ? request.name.trim() : track && localName(track);
-        const cwd = this.#app.cwdOf(id);
+        const { cwd, fs, box } = this.place(id);
 
-        if (track !== undefined && !(await isRemoteBranch(cwd, track))) {
+        if (track !== undefined && !(await isRemoteBranch(cwd, track, fs))) {
             throw new HttpError(400, `${track} is not a remote branch here.`);
         }
 
-        if (!name || !(await validBranchName(cwd, name))) {
+        if (!name || !(await validBranchName(cwd, name, fs))) {
             throw new HttpError(400, `${name ? `“${name}”` : "That"} cannot be a branch name.`);
         }
 
@@ -127,13 +156,17 @@ export class Workspace {
             );
         }
 
-        const before = this.head(id);
+        const before = box ? undefined : this.head(id);
 
-        await switchBranch(cwd, {
-            name,
-            create: request.create === true,
-            ...(track ? { track } : {}),
-        }).catch((error: unknown) => {
+        await switchBranch(
+            cwd,
+            {
+                name,
+                create: request.create === true,
+                ...(track ? { track } : {}),
+            },
+            fs,
+        ).catch((error: unknown) => {
             throw new HttpError(409, describe(error));
         });
         const from = before !== undefined && "branch" in before ? ` from ${before.branch}` : "";
@@ -339,7 +372,9 @@ export class Workspace {
         this.#app.requireSteer(user);
         await this.#app.conversation(id);
 
-        return this.#files.get(this.#app.cwdOf(id));
+        const { cwd, fs, key } = this.place(id);
+
+        return this.#files.get(cwd, fs, key);
     }
 
     /**
@@ -355,14 +390,18 @@ export class Workspace {
         this.#app.requireSteer(user);
         await this.#app.conversation(id);
         let file: string;
+        const place = this.place(id);
 
         try {
-            file = this.readableFile(user, id, path);
+            // A box's files are the session's own: there is no rest of this machine to keep back.
+            file = place.box
+                ? await this.#app.boxes.boxPath(this.#app.rootOf(id), path)
+                : this.readableFile(user, id, path);
 
             return {
                 path: file,
-                display: displayPath(file, this.#app.cwdOf(id)),
-                ...(await viewFile(file)),
+                display: displayPath(file, place.cwd),
+                ...(await viewFile(file, place.fs)),
             };
         } catch (error) {
             if (error instanceof HttpError || (error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -388,7 +427,8 @@ export class Workspace {
             );
         }
 
-        const kind = await revertFile(this.#app.cwdOf(id), path, user.sessions !== undefined).catch(
+        const { cwd, fs } = this.place(id);
+        const kind = await revertFile(cwd, path, user.sessions !== undefined, fs).catch(
             (error: unknown) => {
                 throw new HttpError(409, describe(error));
             },
@@ -408,10 +448,13 @@ export class Workspace {
         this.#app.requireSteer(user);
 
         // Someone invited to this session only sees the files in its folder, here as in `conversationFile`.
+        const { cwd, fs } = this.place(id);
+
         return changesIn(
-            this.#app.cwdOf(id),
+            cwd,
             await this.#app.transcripts.allEntries(id, false),
             user.sessions !== undefined,
+            fs,
         );
     }
 
@@ -420,8 +463,10 @@ export class Workspace {
         this.#app.requireSee(user, id);
         this.#app.requireSteer(user);
 
+        const { cwd, fs } = this.place(id);
+
         try {
-            return await diffOf(this.#app.cwdOf(id), path, user.sessions !== undefined);
+            return await diffOf(cwd, path, user.sessions !== undefined, fs);
         } catch (error) {
             throw new HttpError(404, describe(error));
         }

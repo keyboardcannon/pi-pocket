@@ -263,13 +263,8 @@ export class BoxManager {
         }
 
         const backend = await this.#backend(link.project);
-        const home = backend.home ?? `/home/${backend.boxUser}`;
         const workspace = backend.workspace ?? "/workspace";
-        const boxPath = path.startsWith("~/")
-            ? `${home}${path.slice(1)}`
-            : isAbsolute(path)
-              ? path
-              : join(workspace, path);
+        const boxPath = await this.boxPath(id, path);
         const local = join(
             this.#options.dataDir,
             "box-files",
@@ -308,6 +303,34 @@ export class BoxManager {
         writeFileSync(local, read.value, { mode: 0o600 });
 
         return local;
+    }
+
+    /** A path as a box session means it, in the box: absolute, `~/\u2026` (the box user's home), or in the workspace. */
+    async boxPath(rootId: string | number, path: string): Promise<string> {
+        const link = this.#options.sessionBox(String(rootId));
+
+        if (link === undefined) {
+            throw new Error("not a box session");
+        }
+
+        const backend = await this.#backend(link.project);
+        const trimmed = path.trim();
+
+        return trimmed === "~" || trimmed.startsWith("~/")
+            ? `${backend.home ?? `/home/${backend.boxUser}`}${trimmed.slice(1)}`
+            : isAbsolute(trimmed)
+              ? trimmed
+              : join(backend.workspace ?? "/workspace", trimmed);
+    }
+
+    /**
+     * The environment of a box session whose box is running now, for the app's own panels; undefined when the box is
+     * stopped (or was not used since this server started). Never starts a box.
+     */
+    runningEnv(rootId: string | number): RemoteExecutionEnv | undefined {
+        const runtime = this.#runtimes.get(String(rootId));
+
+        return runtime?.state === "running" ? runtime.env : undefined;
     }
 
     /** A box session's state for the UI; undefined for a local session. */

@@ -6,7 +6,8 @@
 import { readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parseStatus } from "./changes.ts";
-import { git as runGit, GitError } from "./git.ts";
+import { GitError } from "./git.ts";
+import { localFiles, type SessionFiles } from "./session-files.ts";
 
 /** What a folder has checked out: a branch (one with no commits yet included), or a commit with no branch. */
 export type Head = { branch: string } | { detached: string };
@@ -40,7 +41,11 @@ export type Branches = {
 /** The most branches each list has, newest first: the picker searches what it has. */
 const MAX_BRANCHES = 1000;
 const GIT_TIMEOUT_MS = 15_000;
-const git = (cwd: string, args: string[]) => runGit(cwd, args, { timeoutMs: GIT_TIMEOUT_MS });
+/** Git for branches, in the session's files. */
+const gitIn =
+    (fs: SessionFiles) =>
+    (cwd: string, args: string[]): Promise<string> =>
+        fs.git(cwd, args, { timeoutMs: GIT_TIMEOUT_MS });
 
 /**
  * Where a folder's repository keeps its files: `.git` in it or a folder above, or where a worktree's `.git` file says.
@@ -92,6 +97,28 @@ export function headOf(gitDir: string): Head | undefined {
     return /^[0-9a-f]{40,64}$/.test(head) ? { detached: head.slice(0, 7) } : undefined;
 }
 
+/** What `cwd` has checked out, as `headOf` says it, asking git (Paprika: for a box's repository). */
+async function headByGit(
+    cwd: string,
+    git: (cwd: string, args: string[]) => Promise<string>,
+): Promise<Head | undefined> {
+    const branch = await git(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]).then(
+        (name) => name.trim(),
+        () => "",
+    );
+
+    if (branch !== "") {
+        return { branch };
+    }
+
+    const commit = await git(cwd, ["rev-parse", "--verify", "--quiet", "--short=7", "HEAD"]).then(
+        (sha) => sha.trim(),
+        () => "",
+    );
+
+    return commit === "" ? undefined : { detached: commit };
+}
+
 /** `%(upstream:track,nobracket)`: "ahead 2, behind 1", "gone", or nothing when it is even. */
 function readTrack(track: string): { ahead: number; behind: number; gone: boolean } {
     return {
@@ -102,9 +129,15 @@ function readTrack(track: string): { ahead: number; behind: number; gone: boolea
 }
 
 /** The branches of the repository `cwd` is in, for the branch sheet. */
-export async function branchesIn(cwd: string): Promise<Branches> {
-    const gitDir = gitDirOf(cwd);
-    const head = gitDir === undefined ? undefined : headOf(gitDir);
+export async function branchesIn(cwd: string, fs: SessionFiles = localFiles): Promise<Branches> {
+    const git = gitIn(fs);
+    // On this machine the repository's HEAD file says; elsewhere git does.
+    const gitDir = fs.local ? gitDirOf(cwd) : undefined;
+    const head = fs.local
+        ? gitDir === undefined
+            ? undefined
+            : headOf(gitDir)
+        : await headByGit(cwd, git);
     const checkedOut = head !== undefined && "branch" in head ? head.branch : undefined;
     const fields = [
         "%(refname)",
@@ -182,24 +215,37 @@ export async function branchesIn(cwd: string): Promise<Branches> {
 export const localName = (remote: string) => remote.slice(remote.indexOf("/") + 1);
 
 /** Whether git takes a name for a branch: no spaces, no `..`, not starting with `-`, and the rest of git's rules. */
-export async function validBranchName(cwd: string, name: string): Promise<boolean> {
+export async function validBranchName(
+    cwd: string,
+    name: string,
+    fs: SessionFiles = localFiles,
+): Promise<boolean> {
     if (name === "" || name.startsWith("-")) {
         return false;
     }
 
-    return git(cwd, ["check-ref-format", "--branch", name]).then(
+    return gitIn(fs)(cwd, ["check-ref-format", "--branch", name]).then(
         () => true,
         () => false,
     );
 }
 
 /** Whether `name` (such as `origin/fix`) is one of the repository's remote branches. */
-export async function isRemoteBranch(cwd: string, name: string): Promise<boolean> {
+export async function isRemoteBranch(
+    cwd: string,
+    name: string,
+    fs: SessionFiles = localFiles,
+): Promise<boolean> {
     if (name === "" || name.startsWith("-")) {
         return false;
     }
 
-    return git(cwd, ["rev-parse", "--verify", "--quiet", `refs/remotes/${name}^{commit}`]).then(
+    return gitIn(fs)(cwd, [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/remotes/${name}^{commit}`,
+    ]).then(
         () => true,
         () => false,
     );
@@ -213,6 +259,7 @@ export async function isRemoteBranch(cwd: string, name: string): Promise<boolean
 export async function switchBranch(
     cwd: string,
     target: { name: string; create?: boolean; track?: string },
+    fs: SessionFiles = localFiles,
 ): Promise<void> {
     const args =
         target.track !== undefined
@@ -223,7 +270,7 @@ export async function switchBranch(
               : ["switch", "--no-guess", target.name];
 
     try {
-        await git(cwd, args);
+        await gitIn(fs)(cwd, args);
     } catch (error) {
         throw new GitError(
             error instanceof Error ? cleanMessage(error.message) : String(error),
