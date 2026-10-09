@@ -438,6 +438,8 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "plan.ts",
             "guard.ts",
             "codemode.ts",
+            // Paprika: box sessions' project files.
+            "box.ts",
         ],
     );
     assert.equal(module("browser.ts").title, "Browser");
