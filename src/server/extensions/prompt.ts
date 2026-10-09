@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { defineExtension, type PromptInput, section } from "@earendil-works/pi-durable";
 import { APP_ROOT } from "../config.ts";
+import type { BoxControls } from "../remote/env.ts";
 import { readProject } from "../remote/projects.ts";
 import type { PocketHost } from "../host.ts";
 
@@ -152,6 +153,9 @@ export default function createPrompt(host: PocketHost) {
             return cached.text;
         }
 
+        // The box is being prepared since the message was sent; its files are readable once it is ready.
+        await (env as { box?: BoxControls }).box?.ready();
+
         const files: string[] = [];
 
         try {
@@ -216,6 +220,12 @@ export default function createPrompt(host: PocketHost) {
             section("guidelines", () => promptFile("guidelines.md", GUIDELINES)),
             section("box", (input) =>
                 isRemote(input) ? promptFile("box.md", undefined) : undefined,
+            ),
+            // Paprika: what the agent must know about its box now, such as a failed setup.sh.
+            section("box_status", (input) =>
+                isRemote(input)
+                    ? (input.env as { box?: BoxControls } | undefined)?.box?.status()
+                    : undefined,
             ),
             section("pocket_docs", () => docs(host.dataDir)),
             section("project_context", (input, context) =>

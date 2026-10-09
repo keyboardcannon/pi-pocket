@@ -21,6 +21,12 @@ export interface BoxBackend {
     readonly boxUser: string;
     /** Absolute path of a Node.js >= 22 binary inside the box. */
     readonly nodePath: string;
+    /** The project's directory inside the box; default /workspace. */
+    readonly workspace?: string;
+    /** A shell command as the box user; default: `sudo -n -u <boxUser> -H bash -c '<command>'`. */
+    asUser?(command: string): string;
+    /** A shell command as root; default: `sudo -n bash -c '<command>'`. */
+    asRoot?(command: string): string;
     /** Creates a box from the provider's base image, named `name`, and returns once commands can run in it. */
     create(request: { name: string; project: string }): Promise<{ sandboxId: string }>;
     /** Deletes a box and its disk. */
@@ -31,8 +37,32 @@ export interface BoxBackend {
     stop(box: BoxSpec): Promise<void>;
     /** Makes the provider stop the box by itself at `untilMs` unless renewed again. */
     renewLease(box: BoxSpec, untilMs: number): Promise<void>;
-    /** argv that runs one shell command in the box when the command is appended (an `ssh ... user@host`). */
-    sshArgs(box: BoxSpec): Promise<string[]>;
+    /**
+     * argv that runs one shell command in the box when the command is appended (an `ssh ... user@host`). With
+     * `forward`, the connection also makes `127.0.0.1:boxPort` in the box reach `127.0.0.1:localPort` here.
+     */
+    sshArgs(
+        box: BoxSpec,
+        options?: { forward?: { boxPort: number; localPort: number } },
+    ): Promise<string[]>;
+}
+
+/** Quotes a value for a POSIX shell. */
+export function shellQuote(value: string): string {
+    return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** A command as the box user, through the backend's own wrapper or sudo. */
+export function asBoxUser(backend: BoxBackend, command: string): string {
+    return (
+        backend.asUser?.(command) ??
+        `sudo -n -u ${backend.boxUser} -H bash -c ${shellQuote(command)}`
+    );
+}
+
+/** A command as root, through the backend's own wrapper or sudo. */
+export function asBoxRoot(backend: BoxBackend, command: string): string {
+    return backend.asRoot?.(command) ?? `sudo -n bash -c ${shellQuote(command)}`;
 }
 
 let loaded: Promise<BoxBackend> | undefined;

@@ -1184,7 +1184,9 @@ function StatusLine() {
     const box = currentBox();
 
     if (box !== undefined) {
-        const busy = ["creating", "setting-up", "starting", "stopping"].includes(box.state);
+        const busy =
+            ["creating", "setting-up", "starting", "stopping"].includes(box.state) ||
+            box.setup?.ok === false;
 
         parts.push(
             html`<button
@@ -1193,7 +1195,10 @@ function StatusLine() {
                 onClick=${() => openSheet({ type: "box" })}
             >
                 <${Icon} name="terminal" size=${11} />
-                <span>${box.project}: ${box.state === "none" ? "no box yet" : box.state}</span>
+                <span>
+                    ${box.project}:
+                    ${box.setup?.ok === false ? "setup failed" : box.state === "none" ? "no box yet" : box.state}
+                </span>
             </button>`,
         );
     }

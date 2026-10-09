@@ -39,6 +39,17 @@ export function BoxSheet() {
             <span>State</span>
             <span>${STATES[box.state] ?? box.state}</span>
         </div>
+        ${
+            box.setup?.ok === false &&
+            html`<div class="list-item">
+                    <span>Setup</span>
+                    <span class="warn">setup.sh failed (exit ${box.setup.exitCode})</span>
+                </div>
+                <div class="muted pad">
+                    Its log is <span class="mono">${box.setup.log}</span> in the box. Pi knows, and looks into it with
+                    you before anything else.
+                </div>`
+        }
         <div class="muted pad">
             The box stops after five idle minutes and starts again when Pi needs it. Its files stay; running processes do
             not.

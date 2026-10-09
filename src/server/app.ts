@@ -1191,6 +1191,7 @@ export class PocketApp {
                     id: Number(id),
                     ...meta,
                     ...(box === undefined ? {} : { boxState: box.state }),
+                    ...(box?.setup === undefined ? {} : { boxSetup: box.setup }),
                     busy,
                     waiting: waiting.has(id),
                     ...(endedAt === undefined ? {} : { endedAt }),

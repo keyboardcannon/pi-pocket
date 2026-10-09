@@ -53,17 +53,38 @@ const PASS_HEADERS = [
     "user-agent",
 ];
 
+export interface GitProxyOptions {
+    access(key: string): BoxAccess | undefined;
+    log(line: string): void;
+    /** GitHub's web address; default https://github.com (another in tests). */
+    readonly github?: string;
+    /** GitHub's API address; default https://api.github.com. */
+    readonly api?: string;
+    /** The GitHub token; default: this server's gh login. */
+    token?(): Promise<string>;
+    /** The gh command; default `gh`. */
+    readonly gh?: string;
+}
+
 export class GitProxy {
     readonly #access: (key: string) => BoxAccess | undefined;
     readonly #log: (line: string) => void;
+    readonly #github: string;
+    readonly #api: string;
+    readonly #ghCommand: string;
+    readonly #tokenSource: (() => Promise<string>) | undefined;
     #server: Server | undefined;
     #port: Promise<number> | undefined;
     #token: Promise<string> | undefined;
     readonly #defaultBranches = new Map<string, { at: number; branch: string }>();
 
-    constructor(options: { access(key: string): BoxAccess | undefined; log(line: string): void }) {
+    constructor(options: GitProxyOptions) {
         this.#access = options.access;
         this.#log = options.log;
+        this.#github = (options.github ?? "https://github.com").replace(/\/+$/, "");
+        this.#api = (options.api ?? "https://api.github.com").replace(/\/+$/, "");
+        this.#ghCommand = options.gh ?? "gh";
+        this.#tokenSource = options.token;
     }
 
     /** Starts the proxy on a free local port (once) and returns the port. */
@@ -91,7 +112,7 @@ export class GitProxy {
 
     /** The git identity for commits from boxes: this server's GitHub account and its no-reply address. */
     async identity(): Promise<{ name: string; email: string }> {
-        const response = await fetch("https://api.github.com/user", {
+        const response = await fetch(`${this.#api}/user`, {
             headers: {
                 authorization: `Bearer ${await this.#githubToken()}`,
                 accept: "application/vnd.github+json",
@@ -116,12 +137,22 @@ export class GitProxy {
 
     /** This server's GitHub token, from its gh login. */
     #githubToken(): Promise<string> {
-        this.#token ??= new Promise<string>((resolve, reject) =>
-            execFile("gh", ["auth", "token", "--hostname", "github.com"], (error, stdout) =>
-                error
-                    ? reject(new Error(`no GitHub login for gh on this server: ${error.message}`))
-                    : resolve(stdout.trim()),
-            ),
+        this.#token ??= (
+            this.#tokenSource?.() ??
+            new Promise<string>((resolve, reject) =>
+                execFile(
+                    this.#ghCommand,
+                    ["auth", "token", "--hostname", "github.com"],
+                    (error, stdout) =>
+                        error
+                            ? reject(
+                                  new Error(
+                                      `no GitHub login for gh on this server: ${error.message}`,
+                                  ),
+                              )
+                            : resolve(stdout.trim()),
+                ),
+            )
         ).catch((error: unknown) => {
             this.#token = undefined;
 
@@ -138,7 +169,7 @@ export class GitProxy {
             return cached.branch;
         }
 
-        const response = await fetch(`https://api.github.com/repos/${repo}`, {
+        const response = await fetch(`${this.#api}/repos/${repo}`, {
             headers: {
                 authorization: `Bearer ${await this.#githubToken()}`,
                 accept: "application/vnd.github+json",
@@ -223,7 +254,7 @@ export class GitProxy {
             }
         }
 
-        const upstream = await fetch(`https://github.com/${repo}.git/${git[4]}${url.search}`, {
+        const upstream = await fetch(`${this.#github}/${repo}.git/${git[4]}${url.search}`, {
             method: request.method ?? "GET",
             headers,
             ...(body === undefined
@@ -319,7 +350,7 @@ export class GitProxy {
             ),
         );
         execFile(
-            "gh",
+            this.#ghCommand,
             args,
             {
                 cwd,

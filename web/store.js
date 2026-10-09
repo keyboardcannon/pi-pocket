@@ -1031,7 +1031,8 @@ export const drafts = {
 
 /**
  * Paprika: the box of the conversation on screen (its session's, for a subagent), or undefined for a local session:
- * `{ project, name?, state }`, where state is none, creating, setting-up, starting, running, stopping, or stopped.
+ * `{ project, name?, state, setup? }`, where state is none, creating, setting-up, starting, running, stopping, or stopped,
+ * and setup how the project's setup.sh ended (`{ ok, exitCode, log }`).
  */
 export function currentBox() {
     const { sessions, conversationId, view } = store.state;
@@ -1048,6 +1049,7 @@ export function currentBox() {
                 name: session.box.name,
                 state:
                     session.boxState ?? (session.box.sandboxId === undefined ? "none" : "stopped"),
+                ...(session.boxSetup === undefined ? {} : { setup: session.boxSetup }),
             };
         }
     }

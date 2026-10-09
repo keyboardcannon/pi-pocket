@@ -3,13 +3,16 @@
  *
  * - A session's box link lives in its catalogue entry (`SessionMeta.box`): the project, and once created the box's
  *   name and provider id. Forks copy it and so share the box.
- * - A session with a project and no box gets one on first use (its first message): created from the provider's
- *   base image, then the project's secrets go to ~/.pocket/env and its setup.sh runs once. resume.sh runs at every
- *   start. A link to a box that no longer exists gets a fresh box the same way.
+ * - Sending a message in a box session prepares its box (`prepare`): a session with no box gets one, created from the
+ *   provider's base image, with the project's secrets in ~/.pocket/env and its setup.sh run once; a stopped box is
+ *   started and its resume.sh run. The prompt and tool calls wait for the same preparation. A link to a box that no
+ *   longer exists gets a fresh box the same way.
+ * - setup.sh runs once and is never retried: its result, log tail, and log path (~/.pocket/setup.log in the box) are
+ *   recorded, shown in the app, and told to the agent when it failed. resume.sh's latest result is kept the same way.
  * - A box stops after `idleMs` with no call running or made. Every start and bit of activity keeps a provider-side
  *   lease `leaseMs` ahead, also while a long command runs, so the provider stops the box if this server dies.
- * - `box-state.json` records each box's last activity and whether its setup finished, so a restarted server stops
- *   boxes that went idle meanwhile and retries an unfinished setup.
+ * - `box-state.json` records each box's last activity and script results, so a restarted server stops boxes that
+ *   went idle meanwhile.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -17,12 +20,18 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { type BoxBackend, type BoxSpec, loadBoxBackend } from "./backend.ts";
+import { asBoxRoot, asBoxUser, type BoxBackend, type BoxSpec, loadBoxBackend } from "./backend.ts";
 import { ghShim, gitSetupCommands } from "./box-files.ts";
 import { daemonBundle } from "./bundle.ts";
 import { RemoteExecutionEnv } from "./env.ts";
 import { BOX_GIT_PORT, GitProxy } from "./git-proxy.ts";
-import { type Project, readProject } from "./projects.ts";
+import {
+    PROJECT_FILES,
+    type Project,
+    type ProjectFile,
+    readProject,
+    saveProjectFiles,
+} from "./projects.ts";
 
 /** What a session's catalogue entry records about its box. */
 export interface BoxLink {
@@ -33,6 +42,22 @@ export interface BoxLink {
 
 export type BoxState =
     "none" | "creating" | "setting-up" | "starting" | "running" | "stopping" | "stopped";
+
+/** How a project script (setup.sh, resume.sh) ended. */
+export interface ScriptResult {
+    readonly ok: boolean;
+    readonly exitCode: number;
+    readonly at: number;
+    /** Its log, in the box (logs stay there). */
+    readonly log: string;
+}
+
+/** The parts of the git proxy the boxes use (a fake one in tests). */
+export interface BoxGitProxy {
+    port(): Promise<number>;
+    identity(): Promise<{ name: string; email: string }>;
+    close(): void;
+}
 
 export interface BoxManagerOptions {
     readonly dataDir: string;
@@ -47,22 +72,26 @@ export interface BoxManagerOptions {
     onState?(rootId: string, state: BoxState): void;
     readonly idleMs?: number;
     readonly leaseMs?: number;
+    /** The box backend; default: the module named by $PI_POCKET_BOX_BACKEND. */
+    readonly backend?: Promise<BoxBackend>;
+    /** The git proxy; default: one on this server for GitHub. */
+    readonly gitProxy?: BoxGitProxy;
 }
 
-type StateFile = {
-    boxes: Record<
-        string,
-        {
-            lastActivity: number;
-            running: boolean;
-            setupDone?: boolean;
-            sandboxId?: string;
-            project?: string;
-            /** The box's key for the git proxy; secret, also in the box's git config. */
-            gitKey?: string;
-        }
-    >;
+type BoxRecord = {
+    lastActivity: number;
+    running: boolean;
+    sandboxId?: string;
+    project?: string;
+    /** The box's key for the git proxy; secret, also in the box's git config. */
+    gitKey?: string;
+    setup?: ScriptResult;
+    resume?: ScriptResult;
+    /** Older records: setup finished (before results were kept). */
+    setupDone?: boolean;
 };
+
+type StateFile = { boxes: Record<string, BoxRecord> };
 
 const DEFAULT_IDLE_MS = 5 * 60_000;
 const DEFAULT_LEASE_MS = 60 * 60_000;
@@ -77,24 +106,27 @@ export class BoxManager {
     readonly #runtimes = new Map<string, BoxRuntime>();
     readonly #byBox = new Map<string, BoxRuntime>();
     #state: StateFile | undefined;
-    readonly gitProxy: GitProxy;
+    readonly gitProxy: BoxGitProxy;
 
     constructor(options: BoxManagerOptions) {
         this.#options = options;
-        this.gitProxy = new GitProxy({
-            access: (key) => {
-                for (const [box, entry] of Object.entries(this.#loadState().boxes)) {
-                    if (entry.gitKey !== key || entry.project === undefined) {
-                        continue;
-                    }
+        this.gitProxy =
+            options.gitProxy ??
+            new GitProxy({
+                access: (key) => this.#access(key),
+                log: (line) => this.notice("info", line),
+            });
+    }
 
-                    return { box, repos: readProject(entry.project)?.repos ?? [] };
-                }
+    /** Which box a git proxy key belongs to, and the repositories its project allows. */
+    #access(key: string): { box: string; repos: readonly string[] } | undefined {
+        for (const [box, entry] of Object.entries(this.#loadState().boxes)) {
+            if (entry.gitKey === key && entry.project !== undefined) {
+                return { box, repos: readProject(entry.project)?.repos ?? [] };
+            }
+        }
 
-                return undefined;
-            },
-            log: (line) => this.notice("info", line),
-        });
+        return undefined;
     }
 
     get options(): BoxManagerOptions {
@@ -113,20 +145,22 @@ export class BoxManager {
         this.#options.notice(level, text);
     }
 
+    #backend(project: string): Promise<BoxBackend> {
+        const backend = this.#options.backend ?? loadBoxBackend();
+
+        if (backend === undefined) {
+            throw new Error(`Session uses project ${project}, but no box backend is configured`);
+        }
+
+        return backend;
+    }
+
     /** The runtime of a root conversation's box, or undefined for a local session. */
     #runtime(rootId: string): BoxRuntime | undefined {
         const link = this.#options.sessionBox(rootId);
 
         if (link === undefined) {
             return undefined;
-        }
-
-        const backend = loadBoxBackend();
-
-        if (backend === undefined) {
-            throw new Error(
-                `Session uses project ${link.project}, but no box backend is configured`,
-            );
         }
 
         const shared = link.name === undefined ? undefined : this.#byBox.get(link.name);
@@ -138,7 +172,7 @@ export class BoxManager {
         }
 
         if (runtime === undefined) {
-            runtime = new BoxRuntime(this, rootId, link, backend);
+            runtime = new BoxRuntime(this, rootId, link, this.#backend(link.project));
             this.#runtimes.set(rootId, runtime);
 
             if (link.name !== undefined) {
@@ -159,10 +193,26 @@ export class BoxManager {
         return this.#runtime(String(rootId))?.env;
     }
 
+    /**
+     * A message was sent in this session: create or start its box now, so it is ready when the prompt and tools
+     * need it. Failures are reported as notices; the next use tries again.
+     */
+    prepare(rootId: string | number): Promise<void> | undefined {
+        const runtime = this.#runtime(String(rootId));
+
+        return runtime === undefined
+            ? undefined
+            : runtime.ensure().then(
+                  () => undefined,
+                  (error: unknown) =>
+                      this.notice("warning", `Could not prepare the box: ${describe(error)}`),
+              );
+    }
+
     /** A box session's state for the UI; undefined for a local session. */
     stateOf(
         rootId: string | number,
-    ): { project: string; name?: string; state: BoxState } | undefined {
+    ): { project: string; name?: string; state: BoxState; setup?: ScriptResult } | undefined {
         const link = this.#options.sessionBox(String(rootId));
 
         if (link === undefined) {
@@ -170,6 +220,7 @@ export class BoxManager {
         }
 
         const runtime = this.#runtimes.get(String(rootId));
+        const record = link.name === undefined ? undefined : this.#loadState().boxes[link.name];
 
         return {
             project: link.project,
@@ -178,9 +229,10 @@ export class BoxManager {
                 runtime?.state ??
                 (link.sandboxId === undefined
                     ? "none"
-                    : this.#record(link.name).running
+                    : record?.running === true
                       ? "running"
                       : "stopped"),
+            ...(record?.setup === undefined ? {} : { setup: record.setup }),
         };
     }
 
@@ -227,21 +279,12 @@ export class BoxManager {
         return this.#state;
     }
 
-    #record(name: string | undefined): StateFile["boxes"][string] {
-        return (
-            (name === undefined ? undefined : this.#loadState().boxes[name]) ?? {
-                lastActivity: 0,
-                running: false,
-            }
-        );
+    recordOf(name: string): BoxRecord {
+        return this.#loadState().boxes[name] ?? { lastActivity: 0, running: false };
     }
 
-    recordOf(name: string): StateFile["boxes"][string] {
-        return this.#record(name);
-    }
-
-    record(name: string, patch: Partial<StateFile["boxes"][string]>): void {
-        this.#loadState().boxes[name] = { ...this.#record(name), ...patch };
+    record(name: string, patch: Partial<BoxRecord>): void {
+        this.#loadState().boxes[name] = { ...this.recordOf(name), ...patch };
         this.#save();
     }
 
@@ -256,13 +299,13 @@ export class BoxManager {
                 mode: 0o600,
             });
         } catch (error) {
-            this.notice("warning", `Could not save box state: ${String(error)}`);
+            this.notice("warning", `Could not save box state: ${describe(error)}`);
         }
     }
 
     /** At startup: stop boxes that were left running and have been idle longer than `idleMs`. */
     async reconcile(): Promise<void> {
-        const backendLoad = loadBoxBackend();
+        const backendLoad = this.#options.backend ?? loadBoxBackend();
 
         if (backendLoad === undefined) {
             return;
@@ -279,7 +322,11 @@ export class BoxManager {
                 continue;
             }
 
-            const spec = { name, sandboxId: entry.sandboxId, cwd: "/workspace" };
+            const spec = {
+                name,
+                sandboxId: entry.sandboxId,
+                cwd: backend.workspace ?? "/workspace",
+            };
 
             try {
                 if ((await backend.status(spec)) === "running") {
@@ -289,7 +336,7 @@ export class BoxManager {
 
                 this.record(name, { running: false });
             } catch (error) {
-                this.notice("warning", `Could not stop idle box ${name}: ${String(error)}`);
+                this.notice("warning", `Could not stop idle box ${name}: ${describe(error)}`);
             }
         }
     }
@@ -300,7 +347,7 @@ export class BoxManager {
     }
 }
 
-/** One box: its environment, creation and setup, connection, idle stop, and lease. */
+/** One box: readiness (creation, start, scripts), the daemon connection, idle stop, and lease. */
 class BoxRuntime {
     readonly env: RemoteExecutionEnv;
     state: BoxState = "none";
@@ -316,6 +363,8 @@ class BoxRuntime {
     #idleTimer: NodeJS.Timeout | undefined;
     #renewTimer: NodeJS.Timeout | undefined;
     #stopping: Promise<void> | undefined;
+    /** The preparation in progress; everyone who needs the box waits for the same one. */
+    #ensuring: Promise<{ ssh: string[]; backend: BoxBackend }> | undefined;
 
     constructor(manager: BoxManager, rootId: string, link: BoxLink, backend: Promise<BoxBackend>) {
         this.#manager = manager;
@@ -329,13 +378,39 @@ class BoxRuntime {
             cwd: "/workspace",
             project: link.project,
             connect: (context) => this.#connect(context),
+            box: {
+                ready: async () => {
+                    await this.ensure();
+                },
+                status: () => this.#statusText(),
+                saveProjectFiles: (files, message) => this.#saveProjectFiles(files, message),
+                resolveSetup: () => {
+                    if (this.#name !== undefined) {
+                        this.#manager.record(this.#name, {
+                            setup: {
+                                ok: true,
+                                exitCode: 0,
+                                at: Date.now(),
+                                log: "~/.pocket/setup.log",
+                            },
+                        });
+                    }
+                },
+            },
             localReadPaths: manager.options.localReadPaths(),
             onActivity: (event) => this.#activity(event),
         });
+        void backend.then((resolved) => {
+            this.env.cwd = resolved.workspace ?? "/workspace";
+        });
     }
 
-    #spec(): BoxSpec {
-        return { name: this.#name!, sandboxId: this.#sandboxId!, cwd: "/workspace" };
+    #spec(backend: BoxBackend): BoxSpec {
+        return {
+            name: this.#name!,
+            sandboxId: this.#sandboxId!,
+            cwd: backend.workspace ?? "/workspace",
+        };
     }
 
     #setState(state: BoxState): void {
@@ -343,7 +418,7 @@ class BoxRuntime {
         this.#manager.options.onState?.(this.#rootId, state);
     }
 
-    #project_(): Project {
+    #readProject(): Project {
         const project = readProject(this.#project);
 
         if (project === undefined) {
@@ -353,142 +428,224 @@ class BoxRuntime {
         return project;
     }
 
-    async #connect(_context: Context): Promise<ChildProcessWithoutNullStreams> {
+    /** What the agent should know about the box's scripts: failures of setup.sh or of the latest resume.sh. */
+    #statusText(): string | undefined {
+        if (this.#name === undefined) {
+            return undefined;
+        }
+
+        const record = this.#manager.recordOf(this.#name);
+        const notes: string[] = [];
+
+        if (record.setup !== undefined && !record.setup.ok) {
+            notes.push(
+                `This box's setup.sh failed when the box was created (exit ${record.setup.exitCode}); the box may be ` +
+                    `missing what the project needs. The script is ~/.pocket/setup.sh and its log ${record.setup.log}. ` +
+                    `Before anything else: find out why it failed, explain it to the user, and ask what to do next. ` +
+                    `Do not fix or rerun it unless they ask. When it is settled, save_project_files with ` +
+                    `setupResolved: true removes this note.`,
+            );
+        }
+
+        if (record.resume !== undefined && !record.resume.ok) {
+            notes.push(
+                `This box's resume.sh failed when the box last started (exit ${record.resume.exitCode}); its log is ` +
+                    `${record.resume.log}. Tell the user, and look into it if they ask.`,
+            );
+        }
+
+        return notes.length === 0 ? undefined : notes.join("\n\n");
+    }
+
+    /** Creates or starts the box and runs its scripts, once for everyone who needs it now. */
+    ensure(): Promise<{ ssh: string[]; backend: BoxBackend }> {
+        this.#ensuring ??= this.#ensure().finally(() => {
+            this.#ensuring = undefined;
+        });
+
+        return this.#ensuring;
+    }
+
+    async #ensure(): Promise<{ ssh: string[]; backend: BoxBackend }> {
         await this.#stopping;
         const backend = await this.#backend;
         let started = false;
 
-        if (this.#sandboxId !== undefined && (await backend.status(this.#spec())) === "missing") {
-            this.#manager.notice(
-                "warning",
-                `Box ${this.#name} no longer exists; creating a new one`,
-            );
-            this.#manager.forget(this.#name!);
-            this.#sandboxId = undefined;
-        }
+        try {
+            if (
+                this.#sandboxId !== undefined &&
+                (await backend.status(this.#spec(backend))) === "missing"
+            ) {
+                this.#manager.notice(
+                    "warning",
+                    `Box ${this.#name} no longer exists; creating a new one`,
+                );
+                this.#manager.forget(this.#name!);
+                this.#sandboxId = undefined;
+            }
 
-        if (this.#sandboxId === undefined) {
-            const project = this.#project_();
+            if (this.#sandboxId === undefined) {
+                await this.#create(backend);
+                started = true;
+            } else if ((await backend.status(this.#spec(backend))) !== "running") {
+                this.#setState("starting");
+                this.#manager.notice("info", `Starting box ${this.#name}…`);
+                const began = Date.now();
 
-            this.#name = `pocket-${project.name}-${this.#rootId}`;
-            this.#setState("creating");
-            this.#manager.notice("info", `Creating box ${this.#name}…`);
-            const began = Date.now();
-            const { sandboxId } = await backend.create({ name: this.#name, project: project.name });
+                await backend.start(this.#spec(backend));
+                this.#manager.notice("info", `Box ${this.#name} started in ${seconds(began)}`);
+                this.#leaseUntil = 0;
+                started = true;
+            }
 
-            this.#sandboxId = sandboxId;
-            this.#manager.record(this.#name, {
-                sandboxId,
-                project: project.name,
-                gitKey: randomBytes(24).toString("base64url"),
-                running: true,
+            await this.#renewLease(backend);
+            this.#manager.record(this.#name!, {
+                sandboxId: this.#sandboxId,
                 lastActivity: Date.now(),
-                setupDone: false,
+                running: true,
             });
-            this.#manager.registerBox(this.#name, this);
-            await this.#manager.options.saveBox(this.#rootId, {
-                project: project.name,
-                name: this.#name,
-                sandboxId,
+            // Every connection carries the git tunnel: 127.0.0.1:BOX_GIT_PORT in the box reaches the git proxy here.
+            const ssh = await backend.sshArgs(this.#spec(backend), {
+                forward: { boxPort: BOX_GIT_PORT, localPort: await this.#manager.gitProxy.port() },
             });
-            this.#manager.notice(
-                "info",
-                `Box ${this.#name} created in ${Math.round((Date.now() - began) / 1000)} s`,
-            );
-            started = true;
-        } else if ((await backend.status(this.#spec())) !== "running") {
-            this.#setState("starting");
-            this.#manager.notice("info", `Starting box ${this.#name}…`);
-            const began = Date.now();
+            const record = this.#manager.recordOf(this.#name!);
 
-            await backend.start(this.#spec());
-            this.#manager.notice(
-                "info",
-                `Box ${this.#name} started in ${Math.round((Date.now() - began) / 1000)} s`,
-            );
-            this.#leaseUntil = 0;
-            started = true;
+            if (record.setup === undefined && record.setupDone !== true) {
+                this.#setState("setting-up");
+                await this.#setup(ssh, backend);
+            } else if (started) {
+                await this.#resume(ssh, backend);
+            }
+
+            this.#setState("running");
+
+            return { ssh, backend };
+        } catch (error) {
+            this.#setState(this.#sandboxId === undefined ? "none" : "stopped");
+
+            throw error;
         }
-
-        await this.#renewLease(backend);
-        this.#manager.record(this.#name!, {
-            sandboxId: this.#sandboxId,
-            lastActivity: Date.now(),
-            running: true,
-        });
-        // Every connection carries the git tunnel: 127.0.0.1:BOX_GIT_PORT in the box reaches the git proxy here.
-        const plain = await backend.sshArgs(this.#spec());
-        const proxyPort = await this.#manager.gitProxy.port();
-        const ssh = [
-            plain[0]!,
-            "-R",
-            `127.0.0.1:${BOX_GIT_PORT}:127.0.0.1:${proxyPort}`,
-            ...plain.slice(1),
-        ];
-
-        if (this.#manager.recordOf(this.#name!).setupDone !== true) {
-            this.#setState("setting-up");
-            await this.#setup(ssh, backend);
-            this.#manager.record(this.#name!, { setupDone: true });
-        } else if (started) {
-            await this.#resume(ssh, backend);
-        }
-
-        const bundle = await daemonBundle();
-        const file = `/tmp/pocket-daemon-${bundle.hash}.mjs`;
-
-        await this.#run(
-            ssh,
-            `test -f ${file} || { cat > ${file}.tmp && chmod 644 ${file}.tmp && mv ${file}.tmp ${file}; }`,
-            {
-                input: bundle.code,
-                what: "upload the daemon",
-            },
-        );
-        this.#setState("running");
-        const command = `sudo -n -u ${backend.boxUser} -H ${backend.nodePath} ${file} /workspace`;
-
-        return spawn(ssh[0]!, [...ssh.slice(1), command], { stdio: ["pipe", "pipe", "pipe"] });
     }
 
-    /** First start of a new box: secrets, /workspace, setup.sh, then resume.sh. */
-    async #setup(ssh: string[], backend: BoxBackend): Promise<void> {
-        const project = this.#project_();
-        const user = backend.boxUser;
+    async #create(backend: BoxBackend): Promise<void> {
+        const project = this.#readProject();
 
-        await this.#run(ssh, `sudo -n install -d -o ${user} -g ${user} /workspace`, {
-            what: "create /workspace",
+        this.#name = `pocket-${project.name}-${this.#rootId}`;
+        this.#setState("creating");
+        this.#manager.notice("info", `Creating box ${this.#name}…`);
+        const began = Date.now();
+        const { sandboxId } = await backend.create({ name: this.#name, project: project.name });
+
+        this.#sandboxId = sandboxId;
+        this.#manager.record(this.#name, {
+            sandboxId,
+            project: project.name,
+            gitKey: randomBytes(24).toString("base64url"),
+            running: true,
+            lastActivity: Date.now(),
         });
-        await this.#run(
+        this.#manager.registerBox(this.#name, this);
+        await this.#manager.options.saveBox(this.#rootId, {
+            project: project.name,
+            name: this.#name,
+            sandboxId,
+        });
+        this.#manager.notice("info", `Box ${this.#name} created in ${seconds(began)}`);
+    }
+
+    async #connect(_context: Context): Promise<ChildProcessWithoutNullStreams> {
+        const { ssh, backend } = await this.ensure();
+        const bundle = await daemonBundle();
+        const file = `/tmp/pocket-daemon-${bundle.hash}.mjs`;
+        const upload = await this.#run(
             ssh,
-            `sudo -n -u ${user} -H bash -c 'umask 077; mkdir -p ~/.pocket/bin; cat > ~/.pocket/env'`,
+            `test -f ${file} || { cat > ${file}.tmp && chmod 644 ${file}.tmp && mv ${file}.tmp ${file}; }`,
+            bundle.code,
+        );
+
+        if (upload.code !== 0) {
+            throw new Error(
+                `could not upload the daemon to box ${this.#name}: ${upload.output.trim()}`,
+            );
+        }
+
+        const workspace = backend.workspace ?? "/workspace";
+
+        return spawn(
+            ssh[0]!,
+            [...ssh.slice(1), asBoxUser(backend, `${backend.nodePath} ${file} ${workspace}`)],
             {
-                input: project.secrets ?? "",
-                what: "write the project's secrets",
+                stdio: ["pipe", "pipe", "pipe"],
             },
+        );
+    }
+
+    /**
+     * First start of a new box: /workspace, the project's secrets, git, then setup.sh (once: its result is recorded,
+     * and a failure is reported but not retried) and resume.sh. Failing to reach the box is an error instead.
+     */
+    async #setup(ssh: string[], backend: BoxBackend): Promise<void> {
+        const project = this.#readProject();
+        const workspace = backend.workspace ?? "/workspace";
+
+        await this.#must(
+            ssh,
+            asBoxRoot(
+                backend,
+                `install -d -o ${backend.boxUser} -g ${backend.boxUser} ${workspace}`,
+            ),
+            "create the workspace",
+        );
+        await this.#must(
+            ssh,
+            asBoxUser(backend, "umask 077; mkdir -p ~/.pocket/bin; cat > ~/.pocket/env"),
+            "write the project's secrets",
+            project.secrets ?? "",
         );
         await this.#setupGit(ssh, backend, project);
 
+        // The project's files, as working copies in the box: the scripts run from there, and the agent may change
+        // them and save them back to the project (save_project_files).
+        for (const [file, content] of [
+            ["setup.sh", project.setup],
+            ["resume.sh", project.resume],
+            ["AGENTS.md", project.agents],
+        ] as const) {
+            if (content !== undefined) {
+                await this.#must(
+                    ssh,
+                    asBoxUser(
+                        backend,
+                        `cat > ~/.pocket/${file}${file.endsWith(".sh") ? ` && chmod 755 ~/.pocket/${file}` : ""}`,
+                    ),
+                    `copy ${file} into the box`,
+                    content,
+                );
+            }
+        }
+
         if (project.setup !== undefined) {
             this.#manager.notice("info", `Running ${project.name}/setup.sh in box ${this.#name}…`);
-            const began = Date.now();
+            const result = await this.#script(ssh, backend, "setup", SETUP_TIMEOUT_S);
 
-            await this.#script(ssh, backend, "setup", project.setup, SETUP_TIMEOUT_S);
+            this.#manager.record(this.#name!, { setup: result });
             this.#manager.notice(
-                "info",
-                `setup.sh finished in ${Math.round((Date.now() - began) / 1000)} s`,
+                result.ok ? "info" : "warning",
+                result.ok
+                    ? `setup.sh finished in box ${this.#name}`
+                    : `setup.sh failed in box ${this.#name} (exit ${result.exitCode}); log: ${result.log} in the box`,
             );
+        } else {
+            this.#manager.record(this.#name!, {
+                setup: { ok: true, exitCode: 0, at: Date.now(), log: "" },
+            });
         }
 
         await this.#resume(ssh, backend);
     }
 
-    /**
-     * GitHub through the git proxy on this server: the box's key, git's URL rewrites and identity, and `gh`. Removes
-     * agentbox's git and gh wrappers from the base image, which would otherwise come first on PATH.
-     */
+    /** GitHub through the git proxy on this server: the box's key, git's URL rewrites and identity, and `gh`. */
     async #setupGit(ssh: string[], backend: BoxBackend, project: Project): Promise<void> {
-        const user = backend.boxUser;
         let gitKey = this.#manager.recordOf(this.#name!).gitKey;
 
         if (gitKey === undefined) {
@@ -496,103 +653,155 @@ class BoxRuntime {
             this.#manager.record(this.#name!, { gitKey, project: project.name });
         }
 
-        const asUser = (command: string) => `sudo -n -u ${user} -H bash -c ${shellQuote(command)}`;
         const pathLine = `grep -q pocket/bin ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.pocket/bin:$PATH"' >> ~/.bashrc`;
 
-        await this.#run(
+        await this.#must(
             ssh,
-            "sudo -n rm -f /usr/local/bin/git /usr/local/bin/gh /opt/agentbox/restore/git /opt/agentbox/restore/gh",
-            { what: "remove agentbox's git wrappers" },
+            asBoxUser(backend, "umask 077; cat > ~/.pocket/git-key"),
+            "write the git key",
+            gitKey,
         );
-        await this.#run(ssh, asUser("umask 077; cat > ~/.pocket/git-key"), {
-            input: gitKey,
-            what: "write the git key",
-        });
-        await this.#run(ssh, asUser("cat > ~/.pocket/bin/gh && chmod 755 ~/.pocket/bin/gh"), {
-            input: ghShim(backend.nodePath),
-            what: "install gh",
-        });
-        await this.#run(
+        await this.#must(
             ssh,
-            asUser(gitSetupCommands(gitKey, await this.#manager.gitProxy.identity())),
-            {
-                what: "configure git",
-            },
+            asBoxUser(backend, "cat > ~/.pocket/bin/gh && chmod 755 ~/.pocket/bin/gh"),
+            "install gh",
+            ghShim(backend.nodePath),
         );
-        await this.#run(ssh, asUser(pathLine), { what: "put ~/.pocket/bin on PATH" });
+        await this.#must(
+            ssh,
+            asBoxUser(backend, gitSetupCommands(gitKey, await this.#manager.gitProxy.identity())),
+            "configure git",
+        );
+        await this.#must(ssh, asBoxUser(backend, pathLine), "put ~/.pocket/bin on PATH");
     }
 
+    /** Runs the box's ~/.pocket/resume.sh, if any, and records how it went; the box stays usable either way. */
     async #resume(ssh: string[], backend: BoxBackend): Promise<void> {
-        const project = this.#project_();
+        const present = await this.#run(ssh, asBoxUser(backend, "test -f ~/.pocket/resume.sh"));
 
-        if (project.resume === undefined) {
+        if (present.code !== 0) {
             return;
         }
 
-        try {
-            await this.#script(ssh, backend, "resume", project.resume, RESUME_TIMEOUT_S);
-        } catch (error) {
+        const result = await this.#script(ssh, backend, "resume", RESUME_TIMEOUT_S);
+
+        this.#manager.record(this.#name!, { resume: result });
+
+        if (!result.ok) {
             this.#manager.notice(
                 "warning",
-                `resume.sh failed in box ${this.#name}: ${String(error)}`,
+                `resume.sh failed in box ${this.#name} (exit ${result.exitCode})`,
             );
         }
     }
 
-    /** Runs a project script in /workspace as the box user, with the project's secrets; its log stays in the box. */
+    /**
+     * Runs the box's copy of a project script (~/.pocket/<kind>.sh) in the workspace as the box user, with the
+     * project's secrets. Its output goes to ~/.pocket/<kind>.log and stays in the box.
+     */
     async #script(
         ssh: string[],
         backend: BoxBackend,
         kind: "setup" | "resume",
-        content: string,
         timeoutS: number,
-    ): Promise<void> {
-        const script = `/tmp/pocket-${kind}.sh`;
-        const log = `/tmp/pocket-${kind}.log`;
+    ): Promise<ScriptResult> {
+        const log = `~/.pocket/${kind}.log`;
+        const workspace = backend.workspace ?? "/workspace";
+        const run = await this.#run(
+            ssh,
+            asBoxUser(
+                backend,
+                `set -a; [ -f ~/.pocket/env ] && . ~/.pocket/env; set +a; export PATH="$HOME/.pocket/bin:$PATH"; ` +
+                    `cd ${workspace} && timeout ${timeoutS} bash -l ~/.pocket/${kind}.sh > ${log} 2>&1`,
+            ),
+        );
 
-        await this.#run(ssh, `cat > ${script} && chmod 755 ${script}`, {
-            input: content,
-            what: `upload ${kind}.sh`,
-        });
-        const run =
-            `sudo -n -u ${backend.boxUser} -H bash -c 'set -a; [ -f ~/.pocket/env ] && . ~/.pocket/env; set +a; ` +
-            `export PATH="$HOME/.pocket/bin:$PATH"; ` +
-            `cd /workspace && timeout ${timeoutS} bash -l ${script}' > ${log} 2>&1; ` +
-            `status=$?; tail -n 30 ${log}; exit $status`;
-
-        await this.#run(ssh, run, { what: `run ${kind}.sh (log: ${log} in the box)` });
+        return { ok: run.code === 0, exitCode: run.code, at: Date.now(), log };
     }
 
-    /** Runs one command in the box over SSH; rejects with its output when it fails. */
+    /** Copies the box's working copies of project files back to the project on this server, committed and pushed. */
+    async #saveProjectFiles(files: readonly string[], message: string): Promise<string> {
+        const { ssh, backend } = await this.ensure();
+        const contents: Partial<Record<ProjectFile, string>> = {};
+
+        for (const file of files) {
+            if (!(PROJECT_FILES as readonly string[]).includes(file)) {
+                throw new Error(`${file} is not a project file (${PROJECT_FILES.join(", ")})`);
+            }
+
+            contents[file as ProjectFile] = await this.#readFile(
+                ssh,
+                asBoxUser(backend, `cat ~/.pocket/${file}`),
+                file,
+            );
+        }
+
+        return saveProjectFiles(
+            this.#project,
+            contents,
+            message,
+            await this.#manager.gitProxy.identity(),
+        );
+    }
+
+    /** Runs one command in the box; rejects with its output when it fails. */
+    async #must(ssh: string[], command: string, what: string, input?: string): Promise<string> {
+        const result = await this.#run(ssh, command, input);
+
+        if (result.code !== 0) {
+            throw new Error(
+                `could not ${what} in box ${this.#name} (exit ${result.code}): ${result.output.trim()}`,
+            );
+        }
+
+        return result.output;
+    }
+
+    /** A file's whole content, from a command that prints it to stdout. */
+    #readFile(ssh: string[], command: string, file: string): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const child = spawn(ssh[0]!, [...ssh.slice(1), command]);
+            const chunks: Buffer[] = [];
+            let stderr = "";
+
+            child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+            child.stderr.on("data", (chunk: Buffer) => {
+                stderr = (stderr + chunk.toString("utf8")).slice(-2000);
+            });
+            child.stdin.end();
+            child.on("error", reject);
+            child.on("exit", (code) =>
+                code === 0
+                    ? resolve(Buffer.concat(chunks).toString("utf8"))
+                    : reject(
+                          new Error(
+                              `could not read ~/.pocket/${file} in the box: ${stderr.trim()}`,
+                          ),
+                      ),
+            );
+        });
+    }
+
+    /** Runs one command in the box over SSH: its exit code and the end of its output. */
     #run(
         ssh: string[],
         command: string,
-        options: { input?: string; what: string },
-    ): Promise<string> {
+        input?: string,
+    ): Promise<{ code: number; output: string }> {
         return new Promise((resolve, reject) => {
             const child = spawn(ssh[0]!, [...ssh.slice(1), command]);
             let output = "";
 
-            child.stdout.on(
-                "data",
-                (chunk: Buffer) => (output = (output + chunk.toString("utf8")).slice(-8000)),
-            );
-            child.stderr.on(
-                "data",
-                (chunk: Buffer) => (output = (output + chunk.toString("utf8")).slice(-8000)),
-            );
+            const collect = (chunk: Buffer): void => {
+                output = (output + chunk.toString("utf8")).slice(-8000);
+            };
+
+            child.stdout.on("data", collect);
+            child.stderr.on("data", collect);
             child.stdin.on("error", () => {});
-            child.stdin.end(options.input ?? "");
+            child.stdin.end(input ?? "");
             child.on("error", reject);
-            child.on("exit", (code) =>
-                code === 0
-                    ? resolve(output)
-                    : reject(
-                          new Error(
-                              `could not ${options.what} in box ${this.#name} (exit ${String(code)}):\n${output.trim()}`,
-                          ),
-                      ),
-            );
+            child.on("exit", (code) => resolve({ code: code ?? 1, output }));
         });
     }
 
@@ -631,7 +840,7 @@ class BoxRuntime {
         } catch (error) {
             this.#manager.notice(
                 "warning",
-                `Could not renew the lease of box ${this.#name}: ${String(error)}`,
+                `Could not renew the lease of box ${this.#name}: ${describe(error)}`,
             );
         }
     }
@@ -639,7 +848,7 @@ class BoxRuntime {
     async #renewLease(backend: BoxBackend): Promise<void> {
         const until = Date.now() + this.#manager.leaseMs;
 
-        await backend.renewLease(this.#spec(), until);
+        await backend.renewLease(this.#spec(backend), until);
         this.#leaseUntil = until;
     }
 
@@ -652,7 +861,7 @@ class BoxRuntime {
         await this.stopNow();
     }
 
-    /** Stops the box now; the next call starts it again. */
+    /** Stops the box now; the next use starts it again. */
     async stopNow(): Promise<void> {
         if (this.#sandboxId === undefined) {
             return;
@@ -660,16 +869,19 @@ class BoxRuntime {
 
         clearTimeout(this.#idleTimer);
         this.#stopping ??= (async () => {
+            await this.#ensuring?.catch(() => {});
             this.#setState("stopping");
             await this.env.cleanup(BACKGROUND_CONTEXT);
-            await (await this.#backend).stop(this.#spec());
+            const backend = await this.#backend;
+
+            await backend.stop(this.#spec(backend));
             this.#manager.record(this.#name!, { lastActivity: this.#lastActivity, running: false });
             this.#setState("stopped");
         })()
             .catch((error: unknown) => {
                 this.#manager.notice(
                     "warning",
-                    `Could not stop box ${this.#name}: ${String(error)}`,
+                    `Could not stop box ${this.#name}: ${describe(error)}`,
                 );
             })
             .finally(() => {
@@ -686,7 +898,9 @@ class BoxRuntime {
             return;
         }
 
-        await (await this.#backend).destroy(this.#spec());
+        const backend = await this.#backend;
+
+        await backend.destroy(this.#spec(backend));
         this.#manager.forget(this.#name!);
         this.#manager.notice("info", `Destroyed box ${this.#name}`);
         this.#sandboxId = undefined;
@@ -701,7 +915,10 @@ class BoxRuntime {
     }
 }
 
-/** Quotes a value for a POSIX shell. */
-function shellQuote(value: string): string {
-    return `'${value.replaceAll("'", `'\\''`)}'`;
+function seconds(since: number): string {
+    return `${Math.round((Date.now() - since) / 1000)} s`;
+}
+
+function describe(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
 }

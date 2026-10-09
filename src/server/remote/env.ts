@@ -34,10 +34,27 @@ export interface RemoteEnvOptions {
     connect(context: Context): Promise<ChildProcessWithoutNullStreams>;
     /** Absolute server paths whose reads are served from the server (read-only), e.g. global skills. */
     readonly localReadPaths?: readonly string[];
+    /** The box's own controls: readiness, status, and its project's files. */
+    readonly box?: BoxControls;
     /** Called when a call starts and when it settles; drives idle stop and lease renewal. */
     onActivity?(event: "start" | "end"): void;
     /** How long to wait for the daemon's hello. */
     readonly helloTimeoutMs?: number;
+}
+
+/** What a box session can do with its box beyond files and commands. */
+export interface BoxControls {
+    /** Makes the box ready (created, started, set up) without connecting; what the prompt waits for. */
+    ready(): Promise<void>;
+    /** What the agent should know about the box now (failed scripts), if anything. */
+    status(): string | undefined;
+    /**
+     * Saves the box's copies of project files (~/.pocket/setup.sh, resume.sh, AGENTS.md) to the project's
+     * configuration on the server; returns what was committed.
+     */
+    saveProjectFiles(files: readonly string[], message: string): Promise<string>;
+    /** Clears a recorded setup.sh failure. */
+    resolveSetup(): void;
 }
 
 /** The longest a command in a box may run, in seconds. */
@@ -71,6 +88,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
             options.localReadPaths !== undefined && options.localReadPaths.length > 0
                 ? new NodeExecutionEnv({ cwd: "/" })
                 : undefined;
+    }
+
+    /** The box's own controls, when this environment belongs to a box. */
+    get box(): BoxControls | undefined {
+        return this.#options.box;
     }
 
     // --- connection -------------------------------------------------------------------------------------------

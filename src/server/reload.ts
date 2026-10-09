@@ -71,6 +71,8 @@ export const BUILT_IN_TOOLS: ReadonlySet<string> = new Set([
     "subagent",
     "schedule",
     "codemode",
+    // Paprika: box sessions' project files.
+    "save_project_files",
 ]);
 
 /** Pi Pocket's own modules, or the owner's from the drop-in folder. */

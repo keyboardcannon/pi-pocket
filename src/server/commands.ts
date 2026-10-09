@@ -422,6 +422,8 @@ export class Commands {
         }
 
         app.spend.check(user, id);
+        // Paprika: a message in a box session gets its box created or started now, while the request is prepared.
+        void app.boxes.prepare(app.rootOf(id));
 
         const lines = attachments.map(
             (file) =>

@@ -10,7 +10,8 @@
  * Secrets: $PI_POCKET_PROJECT_SECRETS_DIR/<name>.env (KEY=value lines), only on this server. The box gets them at
  * ~/.pocket/env, which the scripts and every command the agent runs see as environment variables.
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface Project {
@@ -105,4 +106,74 @@ export function listProjects(): { name: string; title: string }[] {
         })
         .filter((project): project is { name: string; title: string } => project !== undefined)
         .sort((a, b) => a.title.localeCompare(b.title));
+}
+
+/** Project files a box may save back: its scripts and its instructions. */
+export const PROJECT_FILES = ["setup.sh", "resume.sh", "AGENTS.md"] as const;
+export type ProjectFile = (typeof PROJECT_FILES)[number];
+
+function runGit(cwd: string, args: string[]): Promise<string> {
+    return new Promise((resolve, reject) =>
+        execFile("git", args, { cwd, timeout: 120_000 }, (error, stdout, stderr) =>
+            error
+                ? reject(new Error(`git ${args[0]}: ${(stderr || error.message).trim()}`))
+                : resolve(stdout.trim()),
+        ),
+    );
+}
+
+/**
+ * Writes files into a project's folder, commits them as `identity`, and pushes the configuration repository's
+ * current branch. Pulls first, so the commit sits on top of what is on GitHub. Returns what was committed.
+ */
+export async function saveProjectFiles(
+    name: string,
+    files: Partial<Record<ProjectFile, string>>,
+    message: string,
+    identity: { name: string; email: string },
+): Promise<string> {
+    const dir = projectsDir();
+
+    if (dir === undefined || readProject(name) === undefined) {
+        throw new Error(`no project named ${name}`);
+    }
+
+    const folder = join(dir, name);
+    const root = await runGit(folder, ["rev-parse", "--show-toplevel"]);
+
+    await runGit(root, ["pull", "--ff-only", "--quiet"]);
+
+    const paths: string[] = [];
+
+    for (const [file, content] of Object.entries(files) as [ProjectFile, string][]) {
+        const path = join(folder, file);
+
+        writeFileSync(path, content.endsWith("\n") ? content : `${content}\n`);
+
+        if (file.endsWith(".sh")) {
+            chmodSync(path, 0o755);
+        }
+
+        paths.push(path);
+    }
+
+    await runGit(root, ["add", "--", ...paths]);
+
+    if ((await runGit(root, ["diff", "--cached", "--name-only"])) === "") {
+        return "Nothing changed: the project already has these files as they are.";
+    }
+
+    await runGit(root, [
+        "-c",
+        `user.name=${identity.name}`,
+        "-c",
+        `user.email=${identity.email}`,
+        "commit",
+        "--quiet",
+        "-m",
+        message,
+    ]);
+    await runGit(root, ["push", "--quiet", "origin", "HEAD"]);
+
+    return `Saved and pushed: ${await runGit(root, ["log", "-1", "--stat", "--format=%h %s"])}`;
 }
