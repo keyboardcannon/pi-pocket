@@ -510,6 +510,26 @@ document.addEventListener("click", (event) => {
         return;
     }
 
+    // Paprika: an image in a stopped box: start the box, then load the image again.
+    if ((image.currentSrc || "").includes("/api/box-stopped-image.svg")) {
+        const original = image.getAttribute("src") ?? "";
+
+        event.stopPropagation();
+        image.style.opacity = "0.5";
+        actions.boxAction("start").then(
+            () => {
+                image.style.opacity = "";
+                image.src = `${original}${original.includes("?") ? "&" : "?"}t=${Date.now()}`;
+            },
+            (error) => {
+                image.style.opacity = "";
+                notify("error", error.message);
+            },
+        );
+
+        return;
+    }
+
     openSheet({ type: "image", src: image.currentSrc || image.src, alt: image.alt });
 });
 

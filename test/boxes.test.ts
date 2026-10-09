@@ -272,3 +272,23 @@ test("files sent with a message are copied into the box before the prompt goes a
     assert.deepEqual(readFileSync(boxPath!), readFileSync(local));
     await manager.dispose();
 });
+
+test("an image the agent names is cached from a running box, and a stopped box is never woken for it", async () => {
+    const { backend, manager } = session("good");
+
+    await manager.prepare("7");
+    writeFileSync(join(backend.workspace, "shot.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 9, 9]));
+
+    const cached = await manager.cachedFile("7", "shot.png");
+
+    assert.ok(cached !== undefined && cached.endsWith(".png"));
+    assert.deepEqual(readFileSync(cached), Buffer.from([0x89, 0x50, 0x4e, 0x47, 9, 9]));
+
+    await manager.stop("7");
+    // Cached: still served. Not cached: nothing, and the box stays stopped.
+    assert.equal(await manager.cachedFile("7", "shot.png"), cached);
+    assert.equal(await manager.cachedFile("7", "other.png"), undefined);
+    assert.equal(backend.boxes.get("fake-1"), "stopped");
+    assert.equal(backend.starts, 0);
+    await manager.dispose();
+});

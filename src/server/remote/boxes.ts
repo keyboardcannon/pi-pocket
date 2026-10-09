@@ -15,9 +15,9 @@
  *   went idle meanwhile.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
@@ -106,6 +106,8 @@ const DEFAULT_LEASE_MS = 60 * 60_000;
 const RENEW_MARGIN_MS = 10 * 60_000;
 const SETUP_TIMEOUT_S = 30 * 60;
 const RESUME_TIMEOUT_S = 5 * 60;
+/** The largest file a box session's transcript shows from the box. */
+const MAX_CACHED_FILE = 25 * 1024 * 1024;
 
 export class BoxManager {
     readonly #options: BoxManagerOptions;
@@ -243,6 +245,69 @@ export class BoxManager {
         runtime.queueUploads([...paths].map(([localPath, boxPath]) => ({ localPath, boxPath })));
 
         return paths;
+    }
+
+    /**
+     * An image (or other file) the agent named in a box session, as a file on this server: copied from the box into
+     * `box-files/<session>/` the first time, while the box runs, and served from there after that, so showing a
+     * transcript never needs the box. Undefined when it is not cached and the box is not running: reading never
+     * starts a box. `path` is absolute, `~/…`, or relative to the workspace.
+     */
+    async cachedFile(rootId: string | number, path: string): Promise<string | undefined> {
+        const id = String(rootId);
+        const runtime = this.#runtime(id);
+        const link = this.#options.sessionBox(id);
+
+        if (runtime === undefined || link === undefined) {
+            throw new Error("not a box session");
+        }
+
+        const backend = await this.#backend(link.project);
+        const home = backend.home ?? `/home/${backend.boxUser}`;
+        const workspace = backend.workspace ?? "/workspace";
+        const boxPath = path.startsWith("~/")
+            ? `${home}${path.slice(1)}`
+            : isAbsolute(path)
+              ? path
+              : join(workspace, path);
+        const local = join(
+            this.#options.dataDir,
+            "box-files",
+            id,
+            `${createHash("sha256").update(boxPath).digest("hex").slice(0, 32)}${extname(boxPath).toLowerCase()}`,
+        );
+
+        if (existsSync(local)) {
+            return local;
+        }
+
+        // Only a box that is running right now, by its provider's word: a stale "running" must not start it.
+        if (
+            link.sandboxId === undefined ||
+            link.name === undefined ||
+            (await backend.status({
+                name: link.name,
+                sandboxId: link.sandboxId,
+                cwd: workspace,
+            })) !== "running"
+        ) {
+            return undefined;
+        }
+
+        const read = await runtime.env.readBinaryFile(boxPath, BACKGROUND_CONTEXT);
+
+        if (!read.ok) {
+            throw read.error;
+        }
+
+        if (read.value.byteLength > MAX_CACHED_FILE) {
+            throw new Error(`${path} is too large to show`);
+        }
+
+        mkdirSync(dirname(local), { recursive: true, mode: 0o700 });
+        writeFileSync(local, read.value, { mode: 0o600 });
+
+        return local;
     }
 
     /** A box session's state for the UI; undefined for a local session. */

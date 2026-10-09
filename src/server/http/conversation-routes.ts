@@ -9,6 +9,9 @@ import { HttpError } from "../errors.ts";
 import { serveImage, TYPES } from "./assets.ts";
 import { type ApiRequest, json, readJson, send } from "./io.ts";
 
+/** Paprika: what a box session shows for an image that is in its stopped box (see api.ts). */
+export const BOX_STOPPED_IMAGE = "/api/box-stopped-image.svg";
+
 const MAX_UPLOAD = 50 * 1024 * 1024;
 
 const ENTRY_IMAGE_TYPES = new Set([
@@ -202,12 +205,14 @@ export async function conversationRoutes(
 
         app.requireSteer(user);
 
-        if (body.action === "stop") {
+        if (body.action === "start") {
+            await app.boxes.prepare(app.rootOf(id));
+        } else if (body.action === "stop") {
             await app.boxes.stop(app.rootOf(id));
         } else if (body.action === "destroy") {
             await app.boxes.destroy(app.rootOf(id));
         } else {
-            throw new HttpError(400, "action must be stop or destroy");
+            throw new HttpError(400, "action must be start, stop, or destroy");
         }
 
         return json(response, 200, { ok: true });
@@ -271,6 +276,27 @@ export async function conversationRoutes(
 
         if (requested.trim() === "") {
             throw new HttpError(400, "path is required");
+        }
+
+        // Paprika: in a box session, files the agent names are in the box (attachments stay in uploads here).
+        const root = app.rootOf(id);
+
+        if (
+            app.boxes.stateOf(root) !== undefined &&
+            !resolve(requested).startsWith(join(app.dataDir, "uploads") + sep)
+        ) {
+            const cached = await app.boxes.cachedFile(root, requested);
+
+            if (cached === undefined) {
+                response.writeHead(307, {
+                    location: BOX_STOPPED_IMAGE,
+                    "cache-control": "no-store",
+                });
+
+                return void response.end();
+            }
+
+            return serveImage(request, response, cached);
         }
 
         return serveImage(request, response, app.workspace.conversationFile(user, id, requested));

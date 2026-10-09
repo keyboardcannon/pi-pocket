@@ -31,6 +31,8 @@ import { type ApiRequest, conversationId, type HttpOptions, json, readJson } fro
 import { pushRoutes } from "./push-routes.ts";
 import { listProjects } from "../remote/projects.ts";
 
+const BOX_STOPPED_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="90" viewBox="0 0 320 90"><rect width="320" height="90" rx="10" fill="#7f7f7f22" stroke="#7f7f7f88"/><text x="160" y="40" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#888">This image is in the stopped box</text><text x="160" y="64" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#888">Tap to start the box and load it</text></svg>`;
+
 /** This machine's non-internal IPv4 addresses, for invite links other devices on its networks can open. */
 function lanAddresses(): string[] {
     return Object.values(networkInterfaces())
@@ -283,6 +285,16 @@ export function createApi(options: HttpOptions, auth: Auth) {
 
         if (first === "sessions" && second === undefined && method === "GET") {
             return json(response, 200, app.sessions(user));
+        }
+
+        // Paprika: the stand-in for an image in a stopped box; tapping it starts the box and loads the image.
+        if (first === "box-stopped-image.svg" && method === "GET") {
+            response.writeHead(200, {
+                "content-type": "image/svg+xml",
+                "cache-control": "max-age=86400",
+            });
+
+            return void response.end(BOX_STOPPED_SVG);
         }
 
         // Paprika: projects a session can run in a box.
