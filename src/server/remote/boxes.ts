@@ -308,14 +308,10 @@ export class BoxManager {
 
         return runtime === undefined
             ? undefined
-            : runtime.ensure().then(
+            : // A failure is reported (and logged) by ensure; the next use tries again.
+              runtime.ensure().then(
                   () => undefined,
-                  (error: unknown) =>
-                      this.boxNotice(
-                          runtime.name,
-                          "warning",
-                          `Could not prepare the box: ${describe(error)}`,
-                      ),
+                  () => undefined,
               );
     }
 
@@ -991,6 +987,11 @@ class BoxRuntime {
             return { ssh, backend };
         } catch (error) {
             this.#setState(this.#sandboxId === undefined ? "none" : "stopped");
+            this.#manager.boxNotice(
+                this.#name,
+                "warning",
+                `Could not get box ${this.#name ?? "(new)"} ready: ${describe(error)}`,
+            );
 
             throw error;
         }
@@ -1036,9 +1037,12 @@ class BoxRuntime {
         const { ssh, backend } = await this.ensure();
         const bundle = await daemonBundle();
         const file = `/tmp/pocket-daemon-${bundle.hash}.mjs`;
+        const size = Buffer.byteLength(bundle.code);
+        // Whole, not just there: just after a box resumes, a file can be there before its contents (Boat restores
+        // lazily), and an empty module runs and exits without a word.
         const upload = await this.#run(
             ssh,
-            `test -f ${file} || { cat > ${file}.tmp && chmod 644 ${file}.tmp && mv ${file}.tmp ${file}; }`,
+            `[ "$(stat -c %s ${file} 2>/dev/null)" = ${size} ] || { cat > ${file}.tmp && chmod 644 ${file}.tmp && mv ${file}.tmp ${file}; }`,
             bundle.code,
         );
 
