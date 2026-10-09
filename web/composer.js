@@ -17,6 +17,7 @@ import {
     attempt,
     canSteer,
     collab,
+    currentBox,
     drafts,
     notify,
     openSheet,
@@ -1179,8 +1180,26 @@ function StatusLine() {
         );
     }
 
+    // Paprika: a box session shows its box, first; the branch below would be this server's folder's, not the box's.
+    const box = currentBox();
+
+    if (box !== undefined) {
+        const busy = ["creating", "setting-up", "starting", "stopping"].includes(box.state);
+
+        parts.push(
+            html`<button
+                class=${`branch ${busy ? "warn" : ""}`}
+                title="The session's box"
+                onClick=${() => openSheet({ type: "box" })}
+            >
+                <${Icon} name="terminal" size=${11} />
+                <span>${box.project}: ${box.state === "none" ? "no box yet" : box.state}</span>
+            </button>`,
+        );
+    }
+
     // The git branch, first as in an editor's status bar: a tap switches it.
-    if (view.branch) {
+    if (view.branch && box === undefined) {
         const label = html`<${Icon} name="fork" size=${11} />
             <span>${headLabel(view.branch)}</span>`;
 

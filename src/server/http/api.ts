@@ -29,6 +29,7 @@ import { conversationRoutes } from "./conversation-routes.ts";
 import { createEventStreams } from "./events.ts";
 import { type ApiRequest, conversationId, type HttpOptions, json, readJson } from "./io.ts";
 import { pushRoutes } from "./push-routes.ts";
+import { listProjects } from "../remote/projects.ts";
 
 /** This machine's non-internal IPv4 addresses, for invite links other devices on its networks can open. */
 function lanAddresses(): string[] {
@@ -284,10 +285,20 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, app.sessions(user));
         }
 
+        // Paprika: projects a session can run in a box.
+        if (first === "projects" && second === undefined && method === "GET") {
+            app.requireSteer(user);
+
+            return json(response, 200, listProjects());
+        }
+
         if (first === "sessions" && second === undefined && method === "POST") {
-            const body = await readJson<{ cwd?: string; title?: string; worktree?: unknown }>(
-                request,
-            );
+            const body = await readJson<{
+                cwd?: string;
+                title?: string;
+                worktree?: unknown;
+                project?: unknown;
+            }>(request);
 
             return json(response, 200, await app.commands.createSession(user, body));
         }

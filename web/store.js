@@ -818,9 +818,18 @@ export const actions = {
     removeWorktree: (force) => api(`c/${current()}/worktree`, { remove: true, force }),
     clearGoal: () => api(`c/${current()}/goal`, { clear: true }),
     approve: (id, allow) => api(`approvals/${encodeURIComponent(id)}`, { allow }),
-    /** `worktree`: the session works in a git worktree of its own, made from the folder. */
-    createSession: (cwd, { worktree = false } = {}) =>
-        api("sessions", { cwd, ...(worktree ? { worktree } : {}) }),
+    /**
+     * `worktree`: the session works in a git worktree of its own, made from the folder. Paprika: `project`: its tools
+     * run in a remote box of that project instead.
+     */
+    createSession: (cwd, { worktree = false, project } = {}) =>
+        api("sessions", {
+            ...(cwd === undefined ? {} : { cwd }),
+            ...(worktree ? { worktree } : {}),
+            ...(project === undefined ? {} : { project }),
+        }),
+    /** Paprika: "stop" or "destroy" the session's box. */
+    boxAction: (action) => api(`c/${current()}/box`, { action }),
     updateSession: (id, patch) => api(`sessions/${id}`, patch),
     upload: (file) => api(`c/${current()}/upload?name=${encodeURIComponent(file.name)}`, file),
     fullEntry: (entryId) => api(`c/${current()}/entry/${entryId}`),
@@ -1019,3 +1028,29 @@ export const drafts = {
         }
     },
 };
+
+/**
+ * Paprika: the box of the conversation on screen (its session's, for a subagent), or undefined for a local session:
+ * `{ project, name?, state }`, where state is none, creating, setting-up, starting, running, stopping, or stopped.
+ */
+export function currentBox() {
+    const { sessions, conversationId, view } = store.state;
+    const ids = [conversationId, view.conversation?.parent].filter(
+        (id) => id !== undefined && id !== null,
+    );
+
+    for (const id of ids) {
+        const session = sessions.find((each) => String(each.id) === String(id));
+
+        if (session?.box !== undefined) {
+            return {
+                project: session.box.project,
+                name: session.box.name,
+                state:
+                    session.boxState ?? (session.box.sandboxId === undefined ? "none" : "stopped"),
+            };
+        }
+    }
+
+    return undefined;
+}

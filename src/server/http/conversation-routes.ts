@@ -196,6 +196,23 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    // Paprika: stop or destroy the session's box.
+    if (third === "box" && method === "POST") {
+        const body = await readJson<{ action?: unknown }>(request);
+
+        app.requireSteer(user);
+
+        if (body.action === "stop") {
+            await app.boxes.stop(app.rootOf(id));
+        } else if (body.action === "destroy") {
+            await app.boxes.destroy(app.rootOf(id));
+        } else {
+            throw new HttpError(400, "action must be stop or destroy");
+        }
+
+        return json(response, 200, { ok: true });
+    }
+
     if (third === "worktree" && method === "POST") {
         const body = await readJson<{ remove?: unknown; force?: unknown }>(request);
 

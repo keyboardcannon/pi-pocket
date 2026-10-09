@@ -162,7 +162,8 @@ test("exec: output, exit code, cwd, env", () =>
             ctx,
         );
 
-        return [result, chunks.join("")];
+        // stdout and stderr arrive on separate pipes, so their relative order can differ between runs.
+        return [result, chunks.join("").split("\n").sort()];
     }));
 
 test("exec: abort and timeout", async () => {

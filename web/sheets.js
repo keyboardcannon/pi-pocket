@@ -4,6 +4,7 @@ import { ChatSheet } from "./chat.js";
 import { NotificationsSheet } from "./notify.js";
 import { ShareSheet } from "./share.js";
 import { AppearanceSheet } from "./sheets/appearance.js";
+import { BoxSheet } from "./sheets/box.js";
 import { BranchPicker } from "./sheets/branch.js";
 import { ExtensionsSheet } from "./sheets/extensions.js";
 import { FileSheet } from "./sheets/file.js";
@@ -115,6 +116,9 @@ function sheetBody(sheet) {
             break;
         case "branch":
             body = view.conversation ? html`<${BranchPicker} />` : null;
+            break;
+        case "box":
+            body = view.conversation ? html`<${BoxSheet} />` : null;
             break;
         case "cwd":
             body = html`<${CwdSheet} mode=${sheet.mode} />`;

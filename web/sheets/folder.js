@@ -71,6 +71,21 @@ export function CwdSheet({ mode }) {
     const [missing, setMissing] = useState(null);
     const useButton = useRef(null);
     const home = listing?.home ?? server?.home;
+    // Paprika: projects whose sessions run in a remote box.
+    const [projects, setProjects] = useState([]);
+
+    useEffect(() => {
+        if (mode === "new") {
+            api("projects").then(setProjects, () => setProjects([]));
+        }
+    }, []);
+
+    const startProject = (project) =>
+        attempt(async () => {
+            const created = await actions.createSession(undefined, { project });
+
+            navigate(created.id);
+        });
 
     const load = (target, showHidden = hidden) =>
         api(`fs?path=${encodeURIComponent(target)}${showHidden ? "&hidden=1" : ""}`).then(
@@ -133,6 +148,24 @@ export function CwdSheet({ mode }) {
         title=${mode === "change" ? "Working directory" : "New session"}
         onClose=${closeSheet}
     >
+        ${
+            mode === "new" &&
+            projects.length > 0 &&
+            html`<div class="group">
+                <div class="group-title">In a box</div>
+                ${projects.map(
+                    (project) =>
+                        html`<button class="list-item" onClick=${() => startProject(project.name)}>
+                            <span><${Icon} name="terminal" size=${15} /> ${project.title}</span>
+                            <${Icon} name="chevron" size=${14} />
+                        </button>`,
+                )}
+                <div class="muted pad">
+                    The box starts with your first message; its tools run there, on the project's default branch.
+                </div>
+            </div>
+            <div class="group-title">On this server</div>`
+        }
         <div class="row">
             <input
                 class="mono"

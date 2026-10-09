@@ -200,6 +200,8 @@ export class PocketApp {
                 return paths;
             },
             notice: (level, message) => this.notice(level, message),
+            // A box's state shows in the session list.
+            onState: () => this.#scheduleSessions(),
         });
         this.defaultCwd = options.defaultCwd;
         this.supervised = options.supervised;
@@ -1183,10 +1185,12 @@ export class PocketApp {
                 );
                 const chat = this.#lastChat.get(id);
                 const endedAt = this.#endedAt.get(Number(id) as unknown as ConversationId);
+                const box = this.boxes.stateOf(id);
 
                 return {
                     id: Number(id),
                     ...meta,
+                    ...(box === undefined ? {} : { boxState: box.state }),
                     busy,
                     waiting: waiting.has(id),
                     ...(endedAt === undefined ? {} : { endedAt }),
