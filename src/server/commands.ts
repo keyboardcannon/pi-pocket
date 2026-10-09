@@ -45,6 +45,7 @@ import { clientKey, ownRequest } from "./requests.ts";
 import { type Resend, resendContent, resendRequest, ResendTask, userContent } from "./resend.ts";
 import { wantsTitle, writeTitle } from "./titles.ts";
 import { describeMoment, describeRepeat, knownZone } from "./when.ts";
+import { readProject } from "./remote/projects.ts";
 import {
     createWorktree,
     discardWorktree,
@@ -141,10 +142,13 @@ export class Commands {
         this.#app = app;
     }
 
-    /** Start a session in a folder; with `worktree`, in a git worktree of its own made from that folder. */
+    /**
+     * Start a session in a folder; with `worktree`, in a git worktree of its own made from that folder. Paprika: with
+     * `project`, the session's tools run in a remote box of that project, created when its first message is sent.
+     */
     async createSession(
         user: User,
-        request: { cwd?: string; title?: string; worktree?: unknown },
+        request: { cwd?: string; title?: string; worktree?: unknown; project?: unknown },
     ): Promise<{ id: ConversationId }> {
         const app = this.#app;
 
@@ -154,7 +158,17 @@ export class Commands {
             throw new HttpError(403, "You were invited to one session and cannot start new ones.");
         }
 
-        const title = optionalText(request.title, "title")?.trim().slice(0, MAX_TITLE) || undefined;
+        const projectName = optionalText(request.project, "project");
+        const project = projectName === undefined ? undefined : readProject(projectName);
+
+        if (projectName !== undefined && project === undefined) {
+            throw new HttpError(400, `No project named ${projectName}`);
+        }
+
+        const title =
+            optionalText(request.title, "title")?.trim().slice(0, MAX_TITLE) ||
+            project?.title ||
+            undefined;
         const folder = app.workspace.checkDirectory(
             optionalText(request.cwd, "cwd") ?? app.defaultCwd,
         );
@@ -163,7 +177,7 @@ export class Commands {
 
         return this.#inPlace(
             folder,
-            request.worktree === true,
+            project === undefined && request.worktree === true,
             title ?? basename(folder),
             async ({ cwd, worktree }) => {
                 const conversation = await app.harness.createConversation(
@@ -186,6 +200,9 @@ export class Commands {
                                 createdBy: user.id,
                                 ...(title === undefined ? {} : { title }),
                                 ...(worktree === undefined ? {} : { worktree }),
+                                ...(project === undefined
+                                    ? {}
+                                    : { box: { project: project.name } }),
                             };
                         },
                     },
@@ -1230,6 +1247,10 @@ export class Commands {
                 createdBy: user.id,
                 forkedFrom: { id: Number(id), ...(at === undefined ? {} : { entryId: at }) },
                 ...(place.worktree === undefined ? {} : { worktree: place.worktree }),
+                // Paprika: a fork runs in its parent's box.
+                ...(app.sessionMeta(id)?.box === undefined
+                    ? {}
+                    : { box: { ...app.sessionMeta(id)!.box! } }),
             };
 
             if (fork.resend !== undefined) {

@@ -28,6 +28,8 @@ export type SessionMeta = {
     budget?: number;
     /** The git worktree the session works in, when it has one of its own. */
     worktree?: Worktree;
+    /** Paprika: the project and remote box the session's tools run in; forks share it. */
+    box?: { project: string; name?: string; sandboxId?: string };
 };
 
 /** The catalogue of user-facing sessions: ownerless conversations created by the app. Subagents are not listed. */

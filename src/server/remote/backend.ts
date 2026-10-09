@@ -21,6 +21,10 @@ export interface BoxBackend {
     readonly boxUser: string;
     /** Absolute path of a Node.js >= 22 binary inside the box. */
     readonly nodePath: string;
+    /** Creates a box from the provider's base image, named `name`, and returns once commands can run in it. */
+    create(request: { name: string; project: string }): Promise<{ sandboxId: string }>;
+    /** Deletes a box and its disk. */
+    destroy(box: BoxSpec): Promise<void>;
     status(box: BoxSpec): Promise<BoxStatus>;
     /** Starts a stopped box and returns once commands can run in it. */
     start(box: BoxSpec): Promise<void>;

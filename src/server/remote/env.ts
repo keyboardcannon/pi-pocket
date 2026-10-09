@@ -28,6 +28,8 @@ export interface RemoteEnvOptions {
     readonly id: string;
     /** Working directory inside the box. */
     readonly cwd: string;
+    /** The project the box runs, for its prompt instructions. */
+    readonly project?: string;
     /** Opens a connection whose stdin/stdout speak the daemon protocol. Called again after a connection drops. */
     connect(context: Context): Promise<ChildProcessWithoutNullStreams>;
     /** Absolute server paths whose reads are served from the server (read-only), e.g. global skills. */
@@ -50,6 +52,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
     /** Marks a remote environment, for the system prompt's box section. */
     readonly remote = true;
     readonly id: string;
+    readonly project: string | undefined;
     cwd: string;
     readonly #options: RemoteEnvOptions;
     readonly #local: NodeExecutionEnv | undefined;
@@ -60,6 +63,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
         this.#options = options;
         this.id = options.id;
         this.cwd = options.cwd;
+        this.project = options.project;
         this.#local =
             options.localReadPaths !== undefined && options.localReadPaths.length > 0
                 ? new NodeExecutionEnv({ cwd: "/" })

@@ -5,6 +5,9 @@
  * server bundles this file with its own pi-durable and uploads it on connect, so both sides always run the same
  * pi-durable version. Usage: node daemon.mjs <cwd>
  */
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { TextLineReader } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -19,6 +22,32 @@ import {
 } from "./protocol.ts";
 
 const cwd = process.argv[2] ?? process.cwd();
+
+// The project's secrets (KEY=value lines, written at box setup) are in the environment of every command.
+try {
+    for (const line of readFileSync(join(homedir(), ".pocket", "env"), "utf8").split("\n")) {
+        const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+
+        if (match === null) {
+            continue;
+        }
+
+        let value = match[2]!.trim();
+
+        if (
+            value.length >= 2 &&
+            (value[0] === '"' || value[0] === "'") &&
+            value.endsWith(value[0])
+        ) {
+            value = value.slice(1, -1);
+        }
+
+        process.env[match[1]!] = value;
+    }
+} catch {
+    // no secrets file
+}
+
 const env = new NodeExecutionEnv({ cwd });
 const running = new Map<number, AbortController>();
 const readers = new Map<number, TextLineReader>();

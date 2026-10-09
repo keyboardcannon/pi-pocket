@@ -177,6 +177,16 @@ export class PocketApp {
         this.dataDir = options.dataDir;
         this.boxes = new BoxManager({
             dataDir: options.dataDir,
+            sessionBox: (rootId) => this.#sessions[rootId]?.box,
+            saveBox: async (rootId, link) => {
+                await this.harness.commit(async (tx) => {
+                    const meta = (await tx.doc(SessionsDoc)).items[rootId];
+
+                    if (meta !== undefined) {
+                        meta.box = { ...link };
+                    }
+                }, context);
+            },
             // A box session may still read Pi's global skills on this server.
             localReadPaths: () => {
                 const paths = [join(getAgentDir(), "skills")];

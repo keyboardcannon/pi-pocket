@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { defineExtension, type PromptInput, section } from "@earendil-works/pi-durable";
 import { APP_ROOT } from "../config.ts";
+import { readProject } from "../remote/projects.ts";
 import type { PocketHost } from "../host.ts";
 
 const PREAMBLE = `You are Pi, a coding agent running inside Pi Pocket: a durable, multiplayer web app built on Pi Durable. People talk to you from a browser, often a phone, and several people can share one conversation. When more than one person uses this server, each message starts with [from: Name].
@@ -164,6 +165,22 @@ export default function createPrompt(host: PocketHost) {
             }
         } catch (error) {
             host.notice("warning", `Could not load global AGENTS.md files: ${String(error)}`);
+        }
+
+        // The project's own instructions, from its folder on this server.
+        const projectName = (env as { project?: string }).project;
+
+        try {
+            const projectAgents =
+                projectName === undefined ? undefined : readProject(projectName)?.agents;
+
+            if (projectAgents !== undefined && projectAgents.trim() !== "") {
+                files.push(
+                    `<file path="projects/${projectName}/AGENTS.md">\n${projectAgents.trim()}\n</file>`,
+                );
+            }
+        } catch (error) {
+            host.notice("warning", `Could not load project ${projectName}: ${String(error)}`);
         }
 
         const project: string[] = [];
