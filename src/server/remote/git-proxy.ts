@@ -49,8 +49,9 @@ const PASS_HEADERS = [
     "content-type",
     "accept",
     "git-protocol",
+    // The request's own encoding (git gzips large upload-pack requests). Not accept-encoding: fetch asks for and
+    // undoes compression itself.
     "content-encoding",
-    "accept-encoding",
     "user-agent",
 ];
 
@@ -302,7 +303,8 @@ export class GitProxy {
         } as RequestInit);
         const out: Record<string, string> = {};
 
-        for (const name of ["content-type", "cache-control", "content-encoding"]) {
+        // Not content-encoding: fetch has already undone it, so the box gets the body as it is.
+        for (const name of ["content-type", "cache-control"]) {
             const value = upstream.headers.get(name);
 
             if (value !== null) {
