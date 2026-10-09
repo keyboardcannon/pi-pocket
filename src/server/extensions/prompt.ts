@@ -5,6 +5,7 @@
  *
  * Edit freely: saving this file reloads it into the running server.
  */
+import { readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
     formatSkillsForPrompt,
@@ -41,6 +42,34 @@ function docs(dataDir: string): string {
 - When asked about: changing how you behave without code, such as instructions, AGENTS.md, skills, or prompt templates (docs/customizing.md); a new tool, prompt section, or hook (docs/extensions.md, with working examples in docs/examples/); changing Pi Pocket's own code while it runs (docs/self-editing.md); where its code is (docs/map.md); how its parts depend on each other (docs/architecture.md); what a feature does (docs/features.md)
 - Resolve docs/... under ${code}, not the working directory. Read a doc completely, and follow its links, before changing anything.
 - Pi's own documentation (skills, prompt templates, models, providers, settings): ${getDocsPath()}`;
+}
+
+/**
+ * Paprika: the preamble, guidelines, and box section can be replaced with Markdown files in $PI_POCKET_PROMPT_DIR
+ * (preamble.md, guidelines.md, box.md). A missing file keeps the built-in text (box: no section). Files are read again
+ * only when they change on disk, so the prompt stays the same, and cache-friendly, between edits.
+ */
+const PROMPT_DIR = process.env.PI_POCKET_PROMPT_DIR;
+const promptFiles = new Map<string, { mtimeMs: number; text: string }>();
+
+function promptFile(name: string, fallback: string | undefined): string | undefined {
+    if (PROMPT_DIR === undefined || PROMPT_DIR === "") return fallback;
+    const path = join(PROMPT_DIR, name);
+    try {
+        const { mtimeMs } = statSync(path);
+        const cached = promptFiles.get(path);
+        if (cached !== undefined && cached.mtimeMs === mtimeMs) return cached.text;
+        const text = readFileSync(path, "utf8").trim();
+        promptFiles.set(path, { mtimeMs, text });
+        return text === "" ? fallback : text;
+    } catch {
+        return fallback;
+    }
+}
+
+/** Paprika: whether the conversation's tools run in a remote box (set by the remote execution environment). */
+function isRemote(input: PromptInput): boolean {
+    return (input.env as { remote?: unknown } | undefined)?.remote === true;
 }
 
 const STALE_MS = 30_000;
@@ -99,8 +128,11 @@ export default function createPrompt(host: PocketHost) {
     return defineExtension({
         name: "pocket-prompt",
         sections: [
-            section("preamble", () => PREAMBLE, { tag: false }),
-            section("guidelines", () => GUIDELINES),
+            section("preamble", () => promptFile("preamble.md", PREAMBLE), { tag: false }),
+            section("guidelines", () => promptFile("guidelines.md", GUIDELINES)),
+            section("box", (input) =>
+                isRemote(input) ? promptFile("box.md", undefined) : undefined,
+            ),
             section("pocket_docs", () => docs(host.dataDir)),
             section("project_context", (input) => load(cwdOf(input)).context),
             section("skills", (input) => load(cwdOf(input)).skills, { tag: false }),
