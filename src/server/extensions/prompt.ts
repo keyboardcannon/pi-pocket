@@ -6,7 +6,8 @@
  * Edit freely: saving this file reloads it into the running server.
  */
 import { readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import type { Context } from "@earendil-works/chord";
 import {
     formatSkillsForPrompt,
     getDocsPath,
@@ -53,14 +54,24 @@ const PROMPT_DIR = process.env.PI_POCKET_PROMPT_DIR;
 const promptFiles = new Map<string, { mtimeMs: number; text: string }>();
 
 function promptFile(name: string, fallback: string | undefined): string | undefined {
-    if (PROMPT_DIR === undefined || PROMPT_DIR === "") return fallback;
+    if (PROMPT_DIR === undefined || PROMPT_DIR === "") {
+        return fallback;
+    }
+
     const path = join(PROMPT_DIR, name);
+
     try {
         const { mtimeMs } = statSync(path);
         const cached = promptFiles.get(path);
-        if (cached !== undefined && cached.mtimeMs === mtimeMs) return cached.text;
+
+        if (cached !== undefined && cached.mtimeMs === mtimeMs) {
+            return cached.text;
+        }
+
         const text = readFileSync(path, "utf8").trim();
+
         promptFiles.set(path, { mtimeMs, text });
+
         return text === "" ? fallback : text;
     } catch {
         return fallback;
@@ -125,6 +136,62 @@ export default function createPrompt(host: PocketHost) {
 
     const cwdOf = (input: PromptInput) => input.env?.cwd ?? input.agent.cwd ?? process.cwd();
 
+    // Paprika: in a box session the project's AGENTS.md files are in the box. Pi's global ones (in its agent
+    // directory on this server) still come first; skills are the global ones on this server.
+    const remoteContext = new Map<string, { at: number; text: string | undefined }>();
+
+    const loadRemoteContext = async (
+        input: PromptInput,
+        context: Context,
+    ): Promise<string | undefined> => {
+        const env = input.env!;
+        const cached = remoteContext.get(env.id);
+
+        if (cached !== undefined && Date.now() - cached.at < STALE_MS) {
+            return cached.text;
+        }
+
+        const files: string[] = [];
+
+        try {
+            for (const file of loadProjectContextFiles({
+                cwd: host.agentDir,
+                agentDir: host.agentDir,
+            })) {
+                if (file.path.startsWith(host.agentDir)) {
+                    files.push(`<file path="${file.path}">\n${file.content.trim()}\n</file>`);
+                }
+            }
+        } catch (error) {
+            host.notice("warning", `Could not load global AGENTS.md files: ${String(error)}`);
+        }
+
+        const project: string[] = [];
+
+        for (let dir = env.cwd; ; dir = dirname(dir)) {
+            for (const name of ["AGENTS.md", "CLAUDE.md"]) {
+                const path = join(dir, name);
+                const read = await env.readTextFile(path, context);
+
+                if (read.ok) {
+                    project.unshift(`<file path="${path}">\n${read.value.trim()}\n</file>`);
+                    break;
+                }
+            }
+
+            if (dir === dirname(dir)) {
+                break;
+            }
+        }
+
+        files.push(...project);
+        const text = files.length > 0 ? files.join("\n\n") : undefined;
+
+        remoteContext.set(env.id, { at: Date.now(), text });
+
+        return text;
+    };
+
     return defineExtension({
         name: "pocket-prompt",
         sections: [
@@ -134,8 +201,16 @@ export default function createPrompt(host: PocketHost) {
                 isRemote(input) ? promptFile("box.md", undefined) : undefined,
             ),
             section("pocket_docs", () => docs(host.dataDir)),
-            section("project_context", (input) => load(cwdOf(input)).context),
-            section("skills", (input) => load(cwdOf(input)).skills, { tag: false }),
+            section("project_context", (input, context) =>
+                isRemote(input) ? loadRemoteContext(input, context) : load(cwdOf(input)).context,
+            ),
+            section(
+                "skills",
+                (input) => load(isRemote(input) ? host.agentDir : cwdOf(input)).skills,
+                {
+                    tag: false,
+                },
+            ),
             section("environment", (input) => {
                 // The date only, so the prompt stays cache-friendly through the day.
                 const today = new Date().toISOString().slice(0, 10);

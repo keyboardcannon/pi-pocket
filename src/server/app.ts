@@ -29,6 +29,7 @@ import {
     UsageDoc,
     type UsageState,
 } from "@earendil-works/pi-durable";
+import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
@@ -78,6 +79,7 @@ import { Shell } from "./shell.ts";
 import { Spend } from "./spend.ts";
 import { Transcripts } from "./transcripts.ts";
 import { Workspace } from "./workspace.ts";
+import { BoxManager } from "./remote/boxes.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -119,6 +121,8 @@ export class PocketApp {
     readonly guard = new LancetGuard();
     readonly dataDir: string;
     readonly defaultCwd: string;
+    /** Paprika: sessions whose tools run in a remote box. */
+    readonly boxes: BoxManager;
     readonly supervised: boolean;
     readonly startedAt = Date.now();
     /** Set by the launcher over IPC; undefined when the server runs on its own. */
@@ -171,6 +175,22 @@ export class PocketApp {
         this.#configureModels = options.configureModels;
         this.now = options.now ?? Date.now;
         this.dataDir = options.dataDir;
+        this.boxes = new BoxManager({
+            dataDir: options.dataDir,
+            // A box session may still read Pi's global skills on this server.
+            localReadPaths: () => {
+                const paths = [join(getAgentDir(), "skills")];
+
+                try {
+                    paths.push(...this.settings.getSkillPaths());
+                } catch {
+                    // settings not loaded yet
+                }
+
+                return paths;
+            },
+            notice: (level, message) => this.notice(level, message),
+        });
         this.defaultCwd = options.defaultCwd;
         this.supervised = options.supervised;
         this.config = new ConfigStore(options.dataDir);
@@ -299,7 +319,9 @@ export class PocketApp {
                 registry,
                 settings: this.#harnessSettings(),
                 now: this.now,
-                env: ({ cwd }) => this.#env(cwd ?? this.defaultCwd),
+                env: ({ conversationId, cwd }) =>
+                    this.boxes.envFor(this.rootOf(conversationId)) ??
+                    this.#env(cwd ?? this.defaultCwd),
                 conversationCreated: async (tx, conversation) => {
                     // Every conversation gets the app's documents up front, so views can read them from the start.
                     await tx.doc(AuthorsDoc, conversation.id);
@@ -356,6 +378,8 @@ export class PocketApp {
 
         // Work a previous process left unfinished continues now.
         this.harness.resume();
+        // Paprika: stop boxes that went idle while no server was running.
+        void this.boxes.reconcile();
     }
 
     /**
@@ -584,9 +608,9 @@ export class PocketApp {
         } as HarnessSettings;
     }
 
-    /** Where a conversation's commands run: its folder on this machine. */
-    envFor(id: ConversationId): NodeExecutionEnv {
-        return this.#env(this.cwdOf(id));
+    /** Where a conversation's commands run: its box, or its folder on this machine. */
+    envFor(id: ConversationId): ExecutionEnv {
+        return this.boxes.envFor(this.rootOf(id)) ?? this.#env(this.cwdOf(id));
     }
 
     #env(cwd: string): NodeExecutionEnv {
@@ -1700,6 +1724,7 @@ export class PocketApp {
             }
 
             this.providers.close();
+            await this.boxes.dispose().catch(() => {});
 
             try {
                 // Close writes no outcome: running work resumes when the next process opens the storage.
