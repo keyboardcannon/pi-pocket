@@ -1036,13 +1036,15 @@ class BoxRuntime {
     async #connect(_context: Context): Promise<ChildProcessWithoutNullStreams> {
         const { ssh, backend } = await this.ensure();
         const bundle = await daemonBundle();
-        const file = `/tmp/pocket-daemon-${bundle.hash}.mjs`;
-        const size = Buffer.byteLength(bundle.code);
-        // Whole, not just there: just after a box resumes, a file can be there before its contents (Boat restores
-        // lazily), and an empty module runs and exits without a word.
+        // On the box's disk (/tmp does not survive a stop), so it is in the project's snapshot too: sent again only to
+        // a box made from the base image, or when pi-pocket's daemon changed (its hash names the file).
+        const file = `"$HOME/.pocket/daemon-${bundle.hash}.mjs"`;
         const upload = await this.#run(
             ssh,
-            `[ "$(stat -c %s ${file} 2>/dev/null)" = ${size} ] || { cat > ${file}.tmp && chmod 644 ${file}.tmp && mv ${file}.tmp ${file}; }`,
+            asBoxUser(
+                backend,
+                `test -f ${file} || { mkdir -p ~/.pocket && rm -f ~/.pocket/daemon-*.mjs && cat > ${file}.tmp && mv ${file}.tmp ${file}; }`,
+            ),
             bundle.code,
         );
 
