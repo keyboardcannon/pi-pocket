@@ -557,7 +557,7 @@ class BoxRuntime {
         const run =
             `sudo -n -u ${backend.boxUser} -H bash -c 'set -a; [ -f ~/.pocket/env ] && . ~/.pocket/env; set +a; ` +
             `export PATH="$HOME/.pocket/bin:$PATH"; ` +
-            `cd /workspace && timeout ${timeoutS} bash ${script}' > ${log} 2>&1; ` +
+            `cd /workspace && timeout ${timeoutS} bash -l ${script}' > ${log} 2>&1; ` +
             `status=$?; tail -n 30 ${log}; exit $status`;
 
         await this.#run(ssh, run, { what: `run ${kind}.sh (log: ${log} in the box)` });

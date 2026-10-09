@@ -5,6 +5,7 @@
  * server bundles this file with its own pi-durable and uploads it on connect, so both sides always run the same
  * pi-durable version. Usage: node daemon.mjs <cwd>
  */
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -48,8 +49,18 @@ try {
     // no secrets file
 }
 
-// The box's own tools (gh through the server) come first.
-process.env.PATH = `${join(homedir(), ".pocket", "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`;
+// Commands see the box's login PATH (its image puts its tools there), with the box's own (gh) first.
+let loginPath = process.env.PATH ?? "/usr/bin:/bin";
+
+try {
+    loginPath =
+        execFileSync("bash", ["-lc", 'printf %s "$PATH"'], { encoding: "utf8", timeout: 10_000 }) ||
+        loginPath;
+} catch {
+    // keep the inherited PATH
+}
+
+process.env.PATH = `${join(homedir(), ".pocket", "bin")}:${loginPath}`;
 
 const env = new NodeExecutionEnv({ cwd });
 const running = new Map<number, AbortController>();
