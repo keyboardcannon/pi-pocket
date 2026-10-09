@@ -424,10 +424,12 @@ export class Commands {
         app.spend.check(user, id);
         // Paprika: a message in a box session gets its box created or started now, while the request is prepared.
         void app.boxes.prepare(app.rootOf(id));
+        // Paprika: in a box session, attached files are copied into the box, and Pi gets their paths there.
+        const boxPaths = await app.boxes.uploads(app.rootOf(id), id, attachments);
 
         const lines = attachments.map(
             (file) =>
-                `- ${file.path} (${file.name}, ${file.mime || "unknown type"}, ${file.size} bytes)`,
+                `- ${boxPaths?.get(file.path) ?? file.path} (${file.name}, ${file.mime || "unknown type"}, ${file.size} bytes)`,
         );
         const body = this.messageText(
             user,

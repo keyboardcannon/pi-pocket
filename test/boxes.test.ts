@@ -257,3 +257,18 @@ test("the box's changed project files are saved to the project, committed and pu
     assert.match(await env().box!.saveProjectFiles(["setup.sh"], "Again"), /Nothing changed/);
     await manager.dispose();
 });
+
+test("files sent with a message are copied into the box before the prompt goes ahead", async () => {
+    const { backend, manager, env } = session("good");
+    const local = join(root, "photo.png");
+
+    writeFileSync(local, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 255]));
+    void manager.prepare("7");
+    const paths = await manager.uploads("7", 12, [{ path: local }]);
+    const boxPath = paths?.get(local);
+
+    assert.equal(boxPath, `${backend.home}/.pocket/uploads/12/photo.png`);
+    await env().box!.ready();
+    assert.deepEqual(readFileSync(boxPath!), readFileSync(local));
+    await manager.dispose();
+});

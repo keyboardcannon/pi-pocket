@@ -17,10 +17,17 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { asBoxRoot, asBoxUser, type BoxBackend, type BoxSpec, loadBoxBackend } from "./backend.ts";
+import {
+    asBoxRoot,
+    asBoxUser,
+    type BoxBackend,
+    type BoxSpec,
+    loadBoxBackend,
+    shellQuote,
+} from "./backend.ts";
 import { ghShim, gitSetupCommands } from "./box-files.ts";
 import { daemonBundle } from "./bundle.ts";
 import { RemoteExecutionEnv } from "./env.ts";
@@ -209,6 +216,35 @@ export class BoxManager {
               );
     }
 
+    /**
+     * Files sent with a message in a box session: where they will be in the box. They are copied in once the box is
+     * ready, and the prompt waits for that. Undefined for a local session.
+     */
+    async uploads(
+        rootId: string | number,
+        conversationId: string | number,
+        files: readonly { path: string }[],
+    ): Promise<Map<string, string> | undefined> {
+        const runtime = this.#runtime(String(rootId));
+
+        if (runtime === undefined || files.length === 0) {
+            return undefined;
+        }
+
+        const backend = await this.#backend(this.#options.sessionBox(String(rootId))!.project);
+        const home = backend.home ?? `/home/${backend.boxUser}`;
+        const paths = new Map(
+            files.map((file) => [
+                file.path,
+                `${home}/.pocket/uploads/${String(conversationId)}/${basename(file.path)}`,
+            ]),
+        );
+
+        runtime.queueUploads([...paths].map(([localPath, boxPath]) => ({ localPath, boxPath })));
+
+        return paths;
+    }
+
     /** A box session's state for the UI; undefined for a local session. */
     stateOf(
         rootId: string | number,
@@ -365,6 +401,8 @@ class BoxRuntime {
     #stopping: Promise<void> | undefined;
     /** The preparation in progress; everyone who needs the box waits for the same one. */
     #ensuring: Promise<{ ssh: string[]; backend: BoxBackend }> | undefined;
+    /** Copies of sent files still on their way into the box. */
+    #uploads: Promise<void>[] = [];
 
     constructor(manager: BoxManager, rootId: string, link: BoxLink, backend: Promise<BoxBackend>) {
         this.#manager = manager;
@@ -381,6 +419,8 @@ class BoxRuntime {
             box: {
                 ready: async () => {
                     await this.ensure();
+                    // Files sent with a message are in the box before the model hears of them.
+                    await Promise.all(this.#uploads);
                 },
                 status: () => this.#statusText(),
                 saveProjectFiles: (files, message) => this.#saveProjectFiles(files, message),
@@ -782,11 +822,50 @@ class BoxRuntime {
         });
     }
 
+    /**
+     * Copies files sent with a message into the box once it is ready; `ready()` waits for them. Returns at once.
+     * A failed copy is reported; the message still goes out.
+     */
+    queueUploads(files: readonly { localPath: string; boxPath: string }[]): void {
+        const copying = (async () => {
+            const { ssh, backend } = await this.ensure();
+
+            for (const file of files) {
+                const directory = file.boxPath.slice(0, file.boxPath.lastIndexOf("/"));
+                const result = await this.#run(
+                    ssh,
+                    asBoxUser(
+                        backend,
+                        `mkdir -p ${shellQuote(directory)} && cat > ${shellQuote(file.boxPath)}`,
+                    ),
+                    readFileSync(file.localPath),
+                );
+
+                if (result.code !== 0) {
+                    this.#manager.notice(
+                        "warning",
+                        `Could not copy ${file.boxPath} into box ${this.#name}: ${result.output.trim()}`,
+                    );
+                }
+            }
+        })().catch((error: unknown) =>
+            this.#manager.notice(
+                "warning",
+                `Could not copy files into the box: ${describe(error)}`,
+            ),
+        );
+
+        this.#uploads.push(copying);
+        void copying.finally(() => {
+            this.#uploads = this.#uploads.filter((each) => each !== copying);
+        });
+    }
+
     /** Runs one command in the box over SSH: its exit code and the end of its output. */
     #run(
         ssh: string[],
         command: string,
-        input?: string,
+        input?: string | Buffer,
     ): Promise<{ code: number; output: string }> {
         return new Promise((resolve, reject) => {
             const child = spawn(ssh[0]!, [...ssh.slice(1), command]);

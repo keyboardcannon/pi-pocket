@@ -23,6 +23,8 @@ export interface BoxBackend {
     readonly nodePath: string;
     /** The project's directory inside the box; default /workspace. */
     readonly workspace?: string;
+    /** The box user's home directory; default /home/<boxUser>. */
+    readonly home?: string;
     /** A shell command as the box user; default: `sudo -n -u <boxUser> -H bash -c '<command>'`. */
     asUser?(command: string): string;
     /** A shell command as root; default: `sudo -n bash -c '<command>'`. */
