@@ -622,12 +622,38 @@ class BoxRuntime {
 
     /** What the agent should know about the box's scripts: failures of setup.sh or of the latest resume.sh. */
     #statusText(): string | undefined {
-        if (this.#name === undefined) {
-            return undefined;
+        let project: Project | undefined;
+
+        try {
+            project = readProject(this.#project);
+        } catch {
+            // Unreadable project.json: the name will do.
         }
 
-        const record = this.#manager.recordOf(this.#name);
-        const notes: string[] = [];
+        const day = (at: number) => new Date(at).toISOString().slice(0, 10);
+        const record = this.#name === undefined ? undefined : this.#manager.recordOf(this.#name);
+        const snapshot = this.#manager.projectSnapshot(this.#project);
+        const lines = [
+            `Project: ${project?.title ?? this.#project} (${this.#project}). It may write to: ${project === undefined || project.repos.length === 0 ? "no repositories" : project.repos.join(", ")}.`,
+        ];
+
+        if (project !== undefined && project.setup === undefined) {
+            lines.push(
+                "The project has no setup.sh yet: its boxes start from the base image with an empty /workspace.",
+            );
+        } else if (record?.setup?.snapshot !== undefined) {
+            lines.push(
+                `This box was created from the project's snapshot${snapshot?.name === record.setup.snapshot ? ` of ${day(snapshot.at)}` : ""}, so setup.sh did not run in it; ~/.pocket/setup.log is from the run the snapshot was saved after.`,
+            );
+        } else if (record?.setup?.ok === true) {
+            lines.push(`setup.sh ran in this box when it was created, on ${day(record.setup.at)}.`);
+        }
+
+        const notes: string[] = [lines.join("\n")];
+
+        if (record === undefined) {
+            return notes.join("\n\n");
+        }
 
         if (record.setup !== undefined && !record.setup.ok) {
             notes.push(
@@ -646,7 +672,7 @@ class BoxRuntime {
             );
         }
 
-        return notes.length === 0 ? undefined : notes.join("\n\n");
+        return notes.join("\n\n");
     }
 
     /** Creates or starts the box and runs its scripts, once for everyone who needs it now. */

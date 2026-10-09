@@ -201,7 +201,7 @@ test("a failed setup is recorded once, told to the agent, and not run again", as
     assert.equal(backend.starts, 1);
 
     env().box!.resolveSetup();
-    assert.equal(env().box!.status(), undefined);
+    assert.doesNotMatch(env().box!.status() ?? "", /failed/);
     await manager.dispose();
 });
 

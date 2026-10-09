@@ -227,7 +227,8 @@ export default function createPrompt(host: PocketHost) {
                     ? (input.env as { box?: BoxControls } | undefined)?.box?.status()
                     : undefined,
             ),
-            section("pocket_docs", () => docs(host.dataDir)),
+            // Paprika: not in box sessions, where Pi Pocket's code and docs on this server are beside the point.
+            section("pocket_docs", (input) => (isRemote(input) ? undefined : docs(host.dataDir))),
             section("project_context", (input, context) =>
                 isRemote(input) ? loadRemoteContext(input, context) : load(cwdOf(input)).context,
             ),
