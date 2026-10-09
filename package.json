@@ -37,6 +37,7 @@
         "@earendil-works/pi-coding-agent": "1.0.2",
         "@earendil-works/pi-durable": "1.0.2",
         "dompurify": "^3.4.16",
+        "esbuild": "0.28.2",
         "htm": "^3.1.1",
         "jiti": "2.7.0",
         "marked": "^18.0.14",
