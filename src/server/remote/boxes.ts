@@ -338,7 +338,8 @@ export class BoxManager {
      * stopped (or was not used since this server started). Never starts a box.
      */
     runningEnv(rootId: string | number): RemoteExecutionEnv | undefined {
-        const runtime = this.#runtimes.get(String(rootId));
+        // Made when missing: after a restart, a box can be running before anything here used it.
+        const runtime = this.#runtime(String(rootId));
 
         return runtime?.state === "running" ? runtime.env : undefined;
     }
@@ -502,11 +503,19 @@ export class BoxManager {
         const backend = await backendLoad;
 
         for (const [name, entry] of Object.entries(this.#loadState().boxes)) {
-            if (
-                !entry.running ||
-                entry.sandboxId === undefined ||
-                Date.now() - entry.lastActivity < this.idleMs
-            ) {
+            if (!entry.running || entry.sandboxId === undefined) {
+                continue;
+            }
+
+            if (Date.now() - entry.lastActivity < this.idleMs) {
+                // Running and not idle long yet: its session's runtime takes over, and stops it once it is.
+                const prefix = `pocket-${entry.project ?? ""}-`;
+                const rootId = name.startsWith(prefix) ? name.slice(prefix.length) : undefined;
+
+                if (rootId !== undefined && this.#options.sessionBox(rootId)?.name === name) {
+                    this.#runtime(rootId);
+                }
+
                 continue;
             }
 
@@ -592,6 +601,22 @@ class BoxRuntime {
             localReadPaths: manager.options.localReadPaths(),
             onActivity: (event) => this.#activity(event),
         });
+
+        // What the box was when this server last knew (before a restart, say): a running one is stopped once idle.
+        if (link.name !== undefined && link.sandboxId !== undefined) {
+            const record = manager.recordOf(link.name);
+
+            this.state = record.running ? "running" : "stopped";
+
+            if (record.running) {
+                this.#lastActivity = record.lastActivity;
+                this.#idleTimer = setTimeout(
+                    () => void this.#idleStop(),
+                    Math.max(0, record.lastActivity + manager.idleMs - Date.now()) + 1000,
+                );
+            }
+        }
+
         void backend.then((resolved) => {
             this.env.cwd = resolved.workspace ?? "/workspace";
         });
