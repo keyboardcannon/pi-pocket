@@ -11,7 +11,7 @@
  * set to the repository, and its output goes back.
  */
 import { execFile } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -189,17 +189,19 @@ export class GitProxy {
 
         if (git[4] === "git-receive-pack") {
             // The push's ref updates come first, before the pack: check them, then send them on with the rest.
-            const { head, commands } = await readCommands(request);
+            const { head, commands, capabilities } = await readCommands(request);
             const protectedRef = `refs/heads/${await this.#defaultBranch(repo)}`;
             const blocked = commands.find((command) => command.ref === protectedRef);
 
             if (blocked !== undefined) {
                 this.#log(`git proxy: ${access.box}: refused push to ${repo} ${blocked.ref}`);
 
-                return refuse(
+                return rejectPush(
+                    request,
                     response,
-                    403,
-                    `pushes to ${repo}'s default branch are refused: push a branch and open a pull request`,
+                    commands,
+                    capabilities,
+                    `pushes to the default branch are refused: push a branch and open a pull request`,
                 );
             }
 
@@ -269,10 +271,12 @@ export class GitProxy {
             args: string[];
             repo?: string;
         };
+
         const reply = (code: number, stdout: string, stderr: string) => {
             response.writeHead(200, { "content-type": "application/json" });
             response.end(JSON.stringify({ code, stdout, stderr }));
         };
+
         // --repo/-R in the arguments names the repository too; it must be the same allowed one.
         const flagged = args.flatMap((arg, i) =>
             arg === "--repo" || arg === "-R"
@@ -301,9 +305,19 @@ export class GitProxy {
         }
 
         this.#log(`gh proxy: ${access.box}: gh ${args.slice(0, 2).join(" ")} (${repo})`);
-        // An empty directory, so gh never sees a local repository on this server.
+        // A throwaway empty repository whose origin is the allowed one: some gh commands insist on a local repository.
         const cwd = mkdtempSync(join(tmpdir(), "pocket-gh-"));
 
+        await new Promise<void>((resolve) =>
+            execFile("git", ["init", "-q"], { cwd }, () =>
+                execFile(
+                    "git",
+                    ["remote", "add", "origin", `https://github.com/${repo}.git`],
+                    { cwd },
+                    () => resolve(),
+                ),
+            ),
+        );
         execFile(
             "gh",
             args,
@@ -313,12 +327,14 @@ export class GitProxy {
                 timeout: 120_000,
                 maxBuffer: 16 << 20,
             },
-            (error, stdout, stderr) =>
+            (error, stdout, stderr) => {
+                rmSync(cwd, { recursive: true, force: true });
                 reply(
                     error === null ? 0 : typeof error.code === "number" ? error.code : 1,
                     stdout,
                     stderr,
-                ),
+                );
+            },
         );
     }
 }
@@ -330,11 +346,50 @@ function refuse(response: ServerResponse, status: number, message: string): void
 
 type RefCommand = { old: string; new: string; ref: string };
 
+function pktLine(data: Buffer | string): Buffer {
+    const bytes = typeof data === "string" ? Buffer.from(data) : data;
+
+    return Buffer.concat([Buffer.from((bytes.length + 4).toString(16).padStart(4, "0")), bytes]);
+}
+
+/**
+ * Refuses a whole push the way a git server does, so git shows `! [remote rejected] <ref> (<reason>)`: the client's
+ * pack is read and dropped, then every ref gets an `ng` in the status report (side-band framed if the client asked).
+ */
+function rejectPush(
+    request: IncomingMessage,
+    response: ServerResponse,
+    commands: readonly RefCommand[],
+    capabilities: readonly string[],
+    reason: string,
+): void {
+    const report = Buffer.concat([
+        pktLine("unpack ok\n"),
+        ...commands.map((command) => pktLine(`ng ${command.ref} ${reason}\n`)),
+        Buffer.from("0000"),
+    ]);
+    const sideband = capabilities.includes("side-band-64k") || capabilities.includes("side-band");
+    const body = sideband
+        ? Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), Buffer.from("0000")])
+        : report;
+
+    request.resume();
+    request.on("end", () => {
+        response.writeHead(200, {
+            "content-type": "application/x-git-receive-pack-result",
+            "cache-control": "no-cache",
+        });
+        response.end(body);
+    });
+}
+
 /**
  * Reads a receive-pack request's command pkt-lines (up to the flush packet) and pauses the request there; the bytes
  * read so far come back as `head`, and the rest stays in the request for the caller to stream on.
  */
-function readCommands(request: IncomingMessage): Promise<{ head: Buffer; commands: RefCommand[] }> {
+function readCommands(
+    request: IncomingMessage,
+): Promise<{ head: Buffer; commands: RefCommand[]; capabilities: string[] }> {
     if (request.headers["content-encoding"] === "gzip") {
         return Promise.reject(new Error("compressed pushes are not supported"));
     }
@@ -342,6 +397,7 @@ function readCommands(request: IncomingMessage): Promise<{ head: Buffer; command
     return new Promise((resolve, reject) => {
         let head = Buffer.alloc(0);
         const commands: RefCommand[] = [];
+        let capabilities: string[] = [];
         let offset = 0;
 
         const done = (error?: Error): void => {
@@ -351,7 +407,7 @@ function readCommands(request: IncomingMessage): Promise<{ head: Buffer; command
             request.pause();
 
             if (error === undefined) {
-                resolve({ head, commands });
+                resolve({ head, commands, capabilities });
             } else {
                 reject(error);
             }
@@ -380,12 +436,16 @@ function readCommands(request: IncomingMessage): Promise<{ head: Buffer; command
                     return;
                 }
 
-                const line = head
+                const [line, caps] = head
                     .subarray(offset + 4, offset + length)
                     .toString("utf8")
-                    .split("\0")[0]!
-                    .trim();
-                const [oldId, newId, ref] = line.split(" ");
+                    .split("\0");
+                const [oldId, newId, ref] = line!.trim().split(" ");
+
+                // The first command line carries the client's capabilities after a NUL.
+                if (caps !== undefined) {
+                    capabilities = caps.trim().split(" ");
+                }
 
                 if (oldId !== undefined && newId !== undefined && ref !== undefined) {
                     commands.push({ old: oldId, new: newId, ref });
