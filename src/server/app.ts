@@ -1191,7 +1191,7 @@ export class PocketApp {
                 return {
                     id: Number(id),
                     ...meta,
-                    ...(box === undefined ? {} : { boxState: box.state }),
+                    ...(box === undefined ? {} : { boxState: box.state, boxCwd: box.cwd }),
                     // Paprika: a box session shows its project where a local one shows its folder.
                     ...(meta.box === undefined
                         ? {}

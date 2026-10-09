@@ -8,7 +8,7 @@ import { DiffReview, KIND_LETTERS, reloadChanges, useChanges, useWidth } from ".
 import { loadFiles, suggestFiles } from "./files.js";
 import { FileView } from "./sheets/file.js";
 import { boxStoppedNotice } from "./sheets/box.js";
-import { actions, canSteer, closePeople, panelsBeside, store } from "./store.js";
+import { actions, canSteer, closePeople, currentBox, panelsBeside, store } from "./store.js";
 import { html, Icon, Loader, Marked, shortPath, usePresence } from "./ui.js";
 
 const OPEN_KEY = "pocket.files";
@@ -286,7 +286,8 @@ if (savedWidth > 0) {
  */
 function FilesTab({ changes, covering }) {
     const { conversationId: id, view, server, filesTarget } = store.state;
-    const root = view.agent?.cwd ?? view.conversation?.cwd ?? "";
+    // Paprika: a box session's files are its box's.
+    const root = currentBox()?.cwd ?? view.agent?.cwd ?? view.conversation?.cwd ?? "";
     const [expanded, setExpanded] = useState(() => readExpanded(id));
     const [selected, setSelectedState] = useState(() => readOpen(id));
     const [query, setQuery] = useState("");

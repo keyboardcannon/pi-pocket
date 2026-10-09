@@ -45,6 +45,11 @@ export interface BoxBackend {
      * is usable. Projects' boxes then start from their project's snapshot instead of running setup.sh.
      */
     snapshot?(box: BoxSpec, name: string): Promise<void>;
+    /**
+     * Optional: how a snapshot `snapshot` started is doing, for one whose save this server stopped waiting for (it
+     * restarted): still saving, ready, failed, or not there.
+     */
+    snapshotStatus?(name: string): Promise<"saving" | "ready" | "failed" | "missing">;
     /** Optional: deletes a snapshot made by `snapshot`. */
     deleteSnapshot?(name: string): Promise<void>;
     /** Deletes a box and its disk. */

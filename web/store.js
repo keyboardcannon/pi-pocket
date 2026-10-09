@@ -1048,6 +1048,7 @@ export function currentBox() {
             return {
                 project: session.box.project,
                 title: session.projectTitle ?? session.box.project,
+                cwd: session.boxCwd ?? "/workspace",
                 name: session.box.name,
                 state:
                     session.boxState ?? (session.box.sandboxId === undefined ? "none" : "stopped"),

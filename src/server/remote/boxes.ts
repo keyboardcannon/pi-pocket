@@ -112,9 +112,13 @@ type BoxRecord = {
     fromSnapshot?: string;
 };
 
+/** A snapshot being saved: recorded before the save starts, so a restart can take it up again. */
+type PendingSnapshot = ProjectSnapshot & { box: string; previous?: string };
+
 type StateFile = {
     boxes: Record<string, BoxRecord>;
     projectSnapshots?: Record<string, ProjectSnapshot>;
+    pendingSnapshots?: Record<string, PendingSnapshot>;
 };
 
 const DEFAULT_IDLE_MS = 5 * 60_000;
@@ -434,7 +438,9 @@ export class BoxManager {
     /** A box session's state for the UI; undefined for a local session. */
     stateOf(
         rootId: string | number,
-    ): { project: string; name?: string; state: BoxState; setup?: ScriptResult } | undefined {
+    ):
+        | { project: string; cwd: string; name?: string; state: BoxState; setup?: ScriptResult }
+        | undefined {
         const link = this.#options.sessionBox(String(rootId));
 
         if (link === undefined) {
@@ -446,6 +452,7 @@ export class BoxManager {
 
         return {
             project: link.project,
+            cwd: runtime?.env.cwd ?? "/workspace",
             ...(link.name === undefined ? {} : { name: link.name }),
             state:
                 runtime?.state ??
@@ -554,6 +561,102 @@ export class BoxManager {
         this.#save();
     }
 
+    /** Records (or, with undefined, forgets) the snapshot being saved for a project. */
+    setPendingSnapshot(project: string, pending: PendingSnapshot | undefined): void {
+        const state = this.#loadState();
+        const rest = { ...state.pendingSnapshots };
+
+        delete rest[project];
+        state.pendingSnapshots = pending === undefined ? rest : { ...rest, [project]: pending };
+        this.#save();
+    }
+
+    /**
+     * A saved snapshot becomes its project's: later boxes start from it, and the one it replaces is deleted.
+     */
+    async adoptSnapshot(
+        backend: BoxBackend,
+        project: string,
+        saved: PendingSnapshot,
+    ): Promise<void> {
+        this.setProjectSnapshot(project, {
+            name: saved.name,
+            fingerprint: saved.fingerprint,
+            at: Date.now(),
+        });
+        this.setPendingSnapshot(project, undefined);
+
+        if (saved.previous !== undefined && saved.previous !== saved.name) {
+            await backend
+                .deleteSnapshot?.(saved.previous)
+                .catch((error: unknown) =>
+                    this.boxNotice(
+                        saved.box,
+                        "warning",
+                        `Could not delete ${project}'s older snapshot ${saved.previous}: ${describe(error)}`,
+                    ),
+                );
+        }
+    }
+
+    /**
+     * At startup: snapshots whose save this server was waiting for when it stopped. Each is waited for again and
+     * becomes its project's once ready; a failed or missing one is forgotten.
+     */
+    async #resumeSnapshots(backend: BoxBackend): Promise<void> {
+        for (const [project, pending] of Object.entries(this.#loadState().pendingSnapshots ?? {})) {
+            if (backend.snapshotStatus === undefined) {
+                this.setPendingSnapshot(project, undefined);
+                continue;
+            }
+
+            void this.snapshotOnce(project, async () => {
+                const began = Date.now();
+
+                for (;;) {
+                    let status: string;
+
+                    try {
+                        status = await backend.snapshotStatus!(pending.name);
+                    } catch (error) {
+                        // Kept: the next start asks again.
+                        this.boxNotice(
+                            pending.box,
+                            "warning",
+                            `Could not check ${project}'s snapshot ${pending.name}: ${describe(error)}`,
+                        );
+
+                        return;
+                    }
+
+                    if (status === "ready") {
+                        await this.adoptSnapshot(backend, project, pending);
+                        this.boxNotice(
+                            pending.box,
+                            "info",
+                            `Saved ${project}'s snapshot ${pending.name} (after a restart): its next boxes start from it`,
+                        );
+
+                        return;
+                    }
+
+                    if (status !== "saving" || Date.now() - began > 30 * 60_000) {
+                        this.setPendingSnapshot(project, undefined);
+                        this.boxNotice(
+                            pending.box,
+                            "warning",
+                            `${project}'s snapshot ${pending.name} was not saved (${status}); its next new box runs setup.sh again`,
+                        );
+
+                        return;
+                    }
+
+                    await new Promise((resolve) => setTimeout(resolve, 5000));
+                }
+            });
+        }
+    }
+
     readonly #snapshotting = new Map<string, Promise<void>>();
 
     /** Runs `save` unless a snapshot of the project is being saved already (by another box). */
@@ -588,6 +691,8 @@ export class BoxManager {
         }
 
         const backend = await backendLoad;
+
+        void this.#resumeSnapshots(backend);
 
         for (const [name, entry] of Object.entries(this.#loadState().boxes)) {
             if (!entry.running || entry.sandboxId === undefined) {
@@ -665,6 +770,8 @@ class BoxRuntime {
     #ensuring: Promise<{ ssh: string[]; backend: BoxBackend }> | undefined;
     /** Copies of sent files still on their way into the box. */
     #uploads: Promise<void>[] = [];
+    /** Whether this server has given the box its secrets and git setup since it (the server) started. */
+    #accessGiven = false;
 
     constructor(manager: BoxManager, rootId: string, link: BoxLink, backend: Promise<BoxBackend>) {
         this.#manager = manager;
@@ -862,9 +969,22 @@ class BoxRuntime {
             if (record.setup === undefined && record.setupDone !== true) {
                 this.#setState("setting-up");
                 await this.#setup(ssh, backend);
-            } else if (started) {
-                await this.#resume(ssh, backend);
+            } else {
+                // The project's secrets and git setup, again: they may have changed, and a restart while a snapshot
+                // was saved leaves the box without them.
+                if (started || !this.#accessGiven) {
+                    const project = this.#readProject();
+
+                    await this.#writeSecrets(ssh, backend, project);
+                    await this.#setupGit(ssh, backend, project);
+                }
+
+                if (started) {
+                    await this.#resume(ssh, backend);
+                }
             }
+
+            this.#accessGiven = true;
 
             this.#setState("running");
 
@@ -1058,6 +1178,13 @@ class BoxRuntime {
                 `Saving ${project.name}'s snapshot ${name}, for its next boxes…`,
             );
             const began = Date.now();
+            const pending = {
+                name,
+                fingerprint,
+                at: Date.now(),
+                box: this.#name!,
+                ...(previous === undefined ? {} : { previous: previous.name }),
+            };
 
             try {
                 await this.#must(
@@ -1068,9 +1195,15 @@ class BoxRuntime {
                     ),
                     "take the box's secrets out for the snapshot",
                 );
+                // Recorded first: a restart while it is saved takes it up again (reconcile).
+                this.#manager.setPendingSnapshot(project.name, pending);
 
                 try {
                     await backend.snapshot!(this.#spec(backend), name);
+                } catch (error) {
+                    this.#manager.setPendingSnapshot(project.name, undefined);
+
+                    throw error;
                 } finally {
                     await this.#writeSecrets(ssh, backend, project);
                     await this.#setupGit(ssh, backend, project);
@@ -1085,24 +1218,12 @@ class BoxRuntime {
                 return;
             }
 
-            this.#manager.setProjectSnapshot(project.name, { name, fingerprint, at: Date.now() });
+            await this.#manager.adoptSnapshot(backend, project.name, pending);
             this.#manager.boxNotice(
                 this.#name,
                 "info",
                 `Saved ${project.name}'s snapshot ${name} in ${seconds(began)}: its next boxes start from it`,
             );
-
-            if (previous !== undefined && previous.name !== name) {
-                await backend
-                    .deleteSnapshot?.(previous.name)
-                    .catch((error: unknown) =>
-                        this.#manager.boxNotice(
-                            this.#name,
-                            "warning",
-                            `Could not delete ${project.name}'s older snapshot ${previous.name}: ${describe(error)}`,
-                        ),
-                    );
-            }
         });
     }
 
