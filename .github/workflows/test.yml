@@ -28,7 +28,11 @@ jobs:
             - run: npm run lint
             # The three upstream tests that drive the browser engine against a real Chrome time out or never see the page
             # title with the runner's Chrome (they pass locally): skipped here only. The browser-based UI tests still run.
-            - run: >-
+            - env:
+                  # The runner's raw Chromium build (/usr/bin/chromium, found first) closes or never answers over the
+                  # debugging pipe; its Google Chrome answers at once.
+                  PI_POCKET_BROWSER: /usr/bin/google-chrome
+              run: >-
                   node --test
                   --test-skip-pattern="the engine reads, clicks, types in"
                   --test-skip-pattern="a command sent while a navigation swaps the page"
