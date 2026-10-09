@@ -48,6 +48,9 @@ try {
     // no secrets file
 }
 
+// The box's own tools (gh through the server) come first.
+process.env.PATH = `${join(homedir(), ".pocket", "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`;
+
 const env = new NodeExecutionEnv({ cwd });
 const running = new Map<number, AbortController>();
 const readers = new Map<number, TextLineReader>();

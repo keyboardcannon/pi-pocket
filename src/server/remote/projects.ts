@@ -1,7 +1,8 @@
 /**
  * Paprika: projects that sessions can run in a box. One folder per project in $PI_POCKET_PROJECTS_DIR:
  *
- *   <name>/project.json   { "name": "<name>", "title"?: "..." }
+ *   <name>/project.json   { "name": "<name>", "title"?: "...", "repos": ["owner/name", ...] }
+ *                         repos: the GitHub repositories the project's boxes may read and push (see git-proxy.ts)
  *   <name>/setup.sh       optional: run once in a new box, in /workspace, to build the project's environment
  *   <name>/resume.sh      optional: run every time the box starts, before the agent's calls go through
  *   <name>/AGENTS.md      optional: added to the system prompt of the project's sessions
@@ -15,6 +16,8 @@ import { join } from "node:path";
 export interface Project {
     readonly name: string;
     readonly title: string;
+    /** GitHub repositories, `owner/name`, lower case. */
+    readonly repos: readonly string[];
     readonly setup: string | undefined;
     readonly resume: string | undefined;
     readonly agents: string | undefined;
@@ -48,7 +51,7 @@ export function readProject(name: string): Project | undefined {
         return undefined;
     }
 
-    const parsed = JSON.parse(spec) as { name?: string; title?: string };
+    const parsed = JSON.parse(spec) as { name?: string; title?: string; repos?: unknown };
 
     if (parsed.name !== undefined && parsed.name !== name) {
         throw new Error(`project ${name}: project.json names it ${parsed.name}`);
@@ -59,6 +62,11 @@ export function readProject(name: string): Project | undefined {
     return {
         name,
         title: parsed.title ?? name,
+        repos: Array.isArray(parsed.repos)
+            ? parsed.repos
+                  .filter((repo): repo is string => typeof repo === "string")
+                  .map((repo) => repo.toLowerCase())
+            : [],
         setup: optionalFile(join(folder, "setup.sh")),
         resume: optionalFile(join(folder, "resume.sh")),
         agents: optionalFile(join(folder, "AGENTS.md")),

@@ -12,13 +12,16 @@
  *   boxes that went idle meanwhile and retries an unfinished setup.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type BoxBackend, type BoxSpec, loadBoxBackend } from "./backend.ts";
+import { ghShim, gitSetupCommands } from "./box-files.ts";
 import { daemonBundle } from "./bundle.ts";
 import { RemoteExecutionEnv } from "./env.ts";
+import { BOX_GIT_PORT, GitProxy } from "./git-proxy.ts";
 import { type Project, readProject } from "./projects.ts";
 
 /** What a session's catalogue entry records about its box. */
@@ -49,7 +52,15 @@ export interface BoxManagerOptions {
 type StateFile = {
     boxes: Record<
         string,
-        { lastActivity: number; running: boolean; setupDone?: boolean; sandboxId?: string }
+        {
+            lastActivity: number;
+            running: boolean;
+            setupDone?: boolean;
+            sandboxId?: string;
+            project?: string;
+            /** The box's key for the git proxy; secret, also in the box's git config. */
+            gitKey?: string;
+        }
     >;
 };
 
@@ -66,9 +77,24 @@ export class BoxManager {
     readonly #runtimes = new Map<string, BoxRuntime>();
     readonly #byBox = new Map<string, BoxRuntime>();
     #state: StateFile | undefined;
+    readonly gitProxy: GitProxy;
 
     constructor(options: BoxManagerOptions) {
         this.#options = options;
+        this.gitProxy = new GitProxy({
+            access: (key) => {
+                for (const [box, entry] of Object.entries(this.#loadState().boxes)) {
+                    if (entry.gitKey !== key || entry.project === undefined) {
+                        continue;
+                    }
+
+                    return { box, repos: readProject(entry.project)?.repos ?? [] };
+                }
+
+                return undefined;
+            },
+            log: (line) => this.notice("info", line),
+        });
     }
 
     get options(): BoxManagerOptions {
@@ -270,6 +296,7 @@ export class BoxManager {
 
     async dispose(): Promise<void> {
         await Promise.all([...new Set(this.#runtimes.values())].map((runtime) => runtime.detach()));
+        this.gitProxy.close();
     }
 }
 
@@ -352,6 +379,8 @@ class BoxRuntime {
             this.#sandboxId = sandboxId;
             this.#manager.record(this.#name, {
                 sandboxId,
+                project: project.name,
+                gitKey: randomBytes(24).toString("base64url"),
                 running: true,
                 lastActivity: Date.now(),
                 setupDone: false,
@@ -387,7 +416,15 @@ class BoxRuntime {
             lastActivity: Date.now(),
             running: true,
         });
-        const ssh = await backend.sshArgs(this.#spec());
+        // Every connection carries the git tunnel: 127.0.0.1:BOX_GIT_PORT in the box reaches the git proxy here.
+        const plain = await backend.sshArgs(this.#spec());
+        const proxyPort = await this.#manager.gitProxy.port();
+        const ssh = [
+            plain[0]!,
+            "-R",
+            `127.0.0.1:${BOX_GIT_PORT}:127.0.0.1:${proxyPort}`,
+            ...plain.slice(1),
+        ];
 
         if (this.#manager.recordOf(this.#name!).setupDone !== true) {
             this.#setState("setting-up");
@@ -424,12 +461,13 @@ class BoxRuntime {
         });
         await this.#run(
             ssh,
-            `sudo -n -u ${user} -H bash -c 'umask 077; mkdir -p ~/.pocket; cat > ~/.pocket/env'`,
+            `sudo -n -u ${user} -H bash -c 'umask 077; mkdir -p ~/.pocket/bin; cat > ~/.pocket/env'`,
             {
                 input: project.secrets ?? "",
                 what: "write the project's secrets",
             },
         );
+        await this.#setupGit(ssh, backend, project);
 
         if (project.setup !== undefined) {
             this.#manager.notice("info", `Running ${project.name}/setup.sh in box ${this.#name}…`);
@@ -443,6 +481,45 @@ class BoxRuntime {
         }
 
         await this.#resume(ssh, backend);
+    }
+
+    /**
+     * GitHub through the git proxy on this server: the box's key, git's URL rewrites and identity, and `gh`. Removes
+     * agentbox's git and gh wrappers from the base image, which would otherwise come first on PATH.
+     */
+    async #setupGit(ssh: string[], backend: BoxBackend, project: Project): Promise<void> {
+        const user = backend.boxUser;
+        let gitKey = this.#manager.recordOf(this.#name!).gitKey;
+
+        if (gitKey === undefined) {
+            gitKey = randomBytes(24).toString("base64url");
+            this.#manager.record(this.#name!, { gitKey, project: project.name });
+        }
+
+        const asUser = (command: string) => `sudo -n -u ${user} -H bash -c ${shellQuote(command)}`;
+        const pathLine = `grep -q pocket/bin ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.pocket/bin:$PATH"' >> ~/.bashrc`;
+
+        await this.#run(
+            ssh,
+            "sudo -n rm -f /usr/local/bin/git /usr/local/bin/gh /opt/agentbox/restore/git /opt/agentbox/restore/gh",
+            { what: "remove agentbox's git wrappers" },
+        );
+        await this.#run(ssh, asUser("umask 077; cat > ~/.pocket/git-key"), {
+            input: gitKey,
+            what: "write the git key",
+        });
+        await this.#run(ssh, asUser("cat > ~/.pocket/bin/gh && chmod 755 ~/.pocket/bin/gh"), {
+            input: ghShim(backend.nodePath),
+            what: "install gh",
+        });
+        await this.#run(
+            ssh,
+            asUser(gitSetupCommands(gitKey, await this.#manager.gitProxy.identity())),
+            {
+                what: "configure git",
+            },
+        );
+        await this.#run(ssh, asUser(pathLine), { what: "put ~/.pocket/bin on PATH" });
     }
 
     async #resume(ssh: string[], backend: BoxBackend): Promise<void> {
@@ -479,6 +556,7 @@ class BoxRuntime {
         });
         const run =
             `sudo -n -u ${backend.boxUser} -H bash -c 'set -a; [ -f ~/.pocket/env ] && . ~/.pocket/env; set +a; ` +
+            `export PATH="$HOME/.pocket/bin:$PATH"; ` +
             `cd /workspace && timeout ${timeoutS} bash ${script}' > ${log} 2>&1; ` +
             `status=$?; tail -n 30 ${log}; exit $status`;
 
@@ -621,4 +699,9 @@ class BoxRuntime {
         clearInterval(this.#renewTimer);
         await this.env.cleanup(BACKGROUND_CONTEXT);
     }
+}
+
+/** Quotes a value for a POSIX shell. */
+function shellQuote(value: string): string {
+    return `'${value.replaceAll("'", `'\\''`)}'`;
 }

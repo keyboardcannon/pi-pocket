@@ -40,6 +40,9 @@ export interface RemoteEnvOptions {
     readonly helloTimeoutMs?: number;
 }
 
+/** The longest a command in a box may run, in seconds. */
+const MAX_COMMAND_SECONDS = 600;
+
 type Pending = {
     resolve(value: unknown): void;
     reject(error: Error): void;
@@ -389,6 +392,9 @@ export class RemoteExecutionEnv implements ExecutionEnv {
         context: Context,
     ): Promise<Result<ShellExecResult, ExecutionError>> {
         const { onOutput, ...rest } = options ?? {};
+
+        // Commands in a box run for 10 minutes at most; longer work belongs in the background.
+        rest.timeout = Math.min(rest.timeout ?? MAX_COMMAND_SECONDS, MAX_COMMAND_SECONDS);
 
         try {
             return (await this.#call("exec", [command, rest], context, (text) =>
