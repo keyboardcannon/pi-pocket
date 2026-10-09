@@ -20,6 +20,8 @@ jobs:
               with:
                   node-version: 24
                   cache: npm
+            # Ubuntu 24.04's AppArmor blocks Chrome's sandbox, so the browser tests' Chrome never answers.
+            - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
             # No dependency install scripts, as on the server.
             - run: npm ci --ignore-scripts --no-audit --no-fund
             - run: npm run check
