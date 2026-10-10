@@ -138,14 +138,25 @@ export class GitProxy {
         this.#server?.close();
     }
 
-    /** This server's GitHub token, from its gh login. */
+    /**
+     * This server's GitHub token, from its gh login: the account $PI_POCKET_GITHUB_USER names when set (gh can hold
+     * several, and its active one may change), else the active one.
+     */
     #githubToken(): Promise<string> {
+        const user = process.env.PI_POCKET_GITHUB_USER;
+
         this.#token ??= (
             this.#tokenSource?.() ??
             new Promise<string>((resolve, reject) =>
                 execFile(
                     this.#ghCommand,
-                    ["auth", "token", "--hostname", "github.com"],
+                    [
+                        "auth",
+                        "token",
+                        "--hostname",
+                        "github.com",
+                        ...(user === undefined || user === "" ? [] : ["--user", user]),
+                    ],
                     (error, stdout) =>
                         error
                             ? reject(
@@ -398,12 +409,21 @@ export class GitProxy {
                 ),
             ),
         );
+        // The same account as git's requests, whichever gh account is active.
+        const token = await this.#githubToken();
+
         execFile(
             this.#ghCommand,
             args,
             {
                 cwd,
-                env: { ...process.env, GH_REPO: repo, GH_PROMPT_DISABLED: "1", NO_COLOR: "1" },
+                env: {
+                    ...process.env,
+                    GH_TOKEN: token,
+                    GH_REPO: repo,
+                    GH_PROMPT_DISABLED: "1",
+                    NO_COLOR: "1",
+                },
                 timeout: 120_000,
                 maxBuffer: 16 << 20,
             },
